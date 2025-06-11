@@ -69,6 +69,16 @@ class RefineNet(nn.Module):
 		  nn.Linear(512, rot_out_dim),
     )
 
+    # New confidence head: outputs a scalar confidence score between 0 and 1
+    self.conf_head = nn.Sequential(
+      nn.AdaptiveAvgPool1d(1),  # global pooling on sequence dimension
+      nn.Flatten(),
+      nn.Linear(embed_dim, 128),
+      nn.ReLU(inplace=True),
+      nn.Linear(128, 1),
+      nn.Sigmoid()
+    )
+
 
   def forward(self, A, B):
     """
@@ -85,9 +95,17 @@ class RefineNet(nn.Module):
     ab = torch.cat((a,b),1).contiguous()
     ab = self.encodeAB(ab)  #(B,C,H,W)
 
-    ab = self.pos_embed(ab.reshape(bs, ab.shape[1], -1).permute(0,2,1))
+    # Prepare for transformer: reshape and permute
+    ab_reshaped = ab.reshape(bs, ab.shape[1], -1).permute(0, 2, 1)  # (B, SeqLen, embed_dim)
+    ab_pos = self.pos_embed(ab_reshaped)
 
-    output['trans'] = self.trans_head(ab).mean(dim=1)
-    output['rot'] = self.rot_head(ab).mean(dim=1)
+    output['trans'] = self.trans_head(ab_pos).mean(dim=1)  # (B, 3)
+    output['rot'] = self.rot_head(ab_pos).mean(dim=1)    # (B, rot_out_dim)
+
+    # Confidence prediction
+    # ab_pos shape: (B, SeqLen, embed_dim), permute to (B, embed_dim, SeqLen) for pooling
+    ab_pos_perm = ab_pos.permute(0, 2, 1)
+    conf = self.conf_head(ab_pos_perm)  # (B, 1)
+    output['confidence'] = conf.squeeze(-1)  # (B,)
 
     return output

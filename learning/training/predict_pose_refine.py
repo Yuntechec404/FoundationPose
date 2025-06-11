@@ -24,13 +24,13 @@ from datareader import *
 
 @torch.inference_mode()
 def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_ratio, xyz_map, normal_map=None, mesh_diameter=None, cfg=None, glctx=None, mesh_tensors=None, dataset:PoseRefinePairH5Dataset=None):
-  logging.info("Welcome make_crop_data_batch")
+  # logging.info("Welcome make_crop_data_batch")
   H,W = depth.shape[:2]
   args = []
   method = 'box_3d'
   tf_to_crops = compute_crop_window_tf_batch(pts=mesh.vertices, H=H, W=W, poses=ob_in_cams, K=K, crop_ratio=crop_ratio, out_size=(render_size[1], render_size[0]), method=method, mesh_diameter=mesh_diameter)
 
-  logging.info("make tf_to_crops done")
+  # logging.info("make tf_to_crops done")
 
   B = len(ob_in_cams)
   poseA = torch.as_tensor(ob_in_cams, dtype=torch.float, device='cuda')
@@ -58,7 +58,7 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
   if cfg['use_normal']:
     normal_rs = torch.cat(normal_rs, dim=0).permute(0,3,1,2)  #(B,3,H,W)
 
-  logging.info("render done")
+  # logging.info("render done")
 
   rgbBs = kornia.geometry.transform.warp_perspective(torch.as_tensor(rgb, dtype=torch.float, device='cuda').permute(2,0,1)[None].expand(B,-1,-1,-1), tf_to_crops, dsize=render_size, mode='bilinear', align_corners=False)
   if rgb_rs.shape[-2:]!=cfg['input_resize']:
@@ -78,13 +78,13 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
     normalAs = None
     normalBs = None
 
-  logging.info("warp done")
+  # logging.info("warp done")
 
   mesh_diameters = torch.ones((len(rgbAs)), dtype=torch.float, device='cuda')*mesh_diameter
   pose_data = BatchPoseData(rgbAs=rgbAs, rgbBs=rgbBs, depthAs=None, depthBs=None, normalAs=normalAs, normalBs=normalBs, poseA=poseA, poseB=None, xyz_mapAs=xyz_mapAs, xyz_mapBs=xyz_mapBs, tf_to_crops=tf_to_crops, Ks=Ks, mesh_diameters=mesh_diameters)
   pose_data = dataset.transform_batch(batch=pose_data, H_ori=H, W_ori=W, bound=1)
 
-  logging.info("pose batch data done")
+  # logging.info("pose batch data done")
 
   return pose_data
 
@@ -129,19 +129,19 @@ class PoseRefinePredictor:
       self.cfg['zfar'] = np.inf
     if 'normal_uint8' not in self.cfg:
       self.cfg['normal_uint8'] = False
-    logging.info(f"self.cfg: \n {OmegaConf.to_yaml(self.cfg)}")
+    # logging.info(f"self.cfg: \n {OmegaConf.to_yaml(self.cfg)}")
 
     self.dataset = PoseRefinePairH5Dataset(cfg=self.cfg, h5_file='', mode='test')
     self.model = RefineNet(cfg=self.cfg, c_in=self.cfg['c_in']).cuda()
 
-    logging.info(f"Using pretrained model from {ckpt_dir}")
+    # logging.info(f"Using pretrained model from {ckpt_dir}")
     ckpt = torch.load(ckpt_dir)
     if 'model' in ckpt:
       ckpt = ckpt['model']
-    self.model.load_state_dict(ckpt)
+    self.model.load_state_dict(ckpt, strict=False)
 
     self.model.cuda().eval()
-    logging.info("init done")
+    # logging.info("init done")
     self.last_trans_update = None
     self.last_rot_update = None
 
@@ -153,17 +153,17 @@ class PoseRefinePredictor:
     @ob_in_cams: np array (N,4,4)
     '''
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
-    logging.info(f'ob_in_cams:{ob_in_cams.shape}')
+    # logging.info(f'ob_in_cams:{ob_in_cams.shape}')
     tf_to_center = np.eye(4)
     ob_centered_in_cams = ob_in_cams
     mesh_centered = mesh
 
-    logging.info(f'self.cfg.use_normal:{self.cfg.use_normal}')
+    # logging.info(f'self.cfg.use_normal:{self.cfg.use_normal}')
     if not self.cfg.use_normal:
       normal_map = None
 
     crop_ratio = self.cfg['crop_ratio']
-    logging.info(f"trans_normalizer:{self.cfg['trans_normalizer']}, rot_normalizer:{self.cfg['rot_normalizer']}")
+    # logging.info(f"trans_normalizer:{self.cfg['trans_normalizer']}, rot_normalizer:{self.cfg['rot_normalizer']}")
     bs = 1024
 
     B_in_cams = torch.as_tensor(ob_centered_in_cams, device='cuda', dtype=torch.float)
@@ -178,20 +178,28 @@ class PoseRefinePredictor:
     trans_normalizer = self.cfg['trans_normalizer']
     if not isinstance(trans_normalizer, float):
       trans_normalizer = torch.as_tensor(list(trans_normalizer), device='cuda', dtype=torch.float).reshape(1,3)
-
+    
+    all_confidences = []
+    
     for _ in range(iteration):
-      logging.info("making cropped data")
+      # logging.info("making cropped data")
       pose_data = make_crop_data_batch(self.cfg.input_resize, B_in_cams, mesh_centered, rgb_tensor, depth_tensor, K, crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg, glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter)
       B_in_cams = []
+      confidences_iter = []
       for b in range(0, pose_data.rgbAs.shape[0], bs):
         A = torch.cat([pose_data.rgbAs[b:b+bs].cuda(), pose_data.xyz_mapAs[b:b+bs].cuda()], dim=1).float()
         B = torch.cat([pose_data.rgbBs[b:b+bs].cuda(), pose_data.xyz_mapBs[b:b+bs].cuda()], dim=1).float()
-        logging.info("forward start")
+        # logging.info("forward start")
         with torch.cuda.amp.autocast(enabled=self.amp):
           output = self.model(A,B)
         for k in output:
           output[k] = output[k].float()
-        logging.info("forward done")
+        # logging.info("forward done")
+
+        # read confidence
+        conf_scores = output.get("confidence", torch.ones(len(A), device=A.device))
+        confidences_iter.append(conf_scores)
+
         if self.cfg['trans_rep']=='tracknet':
           if not self.cfg['normalize_xyz']:
             trans_delta = torch.tanh(output["trans"])*trans_normalizer
@@ -232,14 +240,22 @@ class PoseRefinePredictor:
         B_in_cams.append(B_in_cam)
 
       B_in_cams = torch.cat(B_in_cams, dim=0).reshape(len(ob_in_cams),4,4)
+      all_confidences.append(torch.cat(confidences_iter, dim=0))  # 迭代的置信度
 
     B_in_cams_out = B_in_cams@torch.tensor(tf_to_center[None], device='cuda', dtype=torch.float)
     torch.cuda.empty_cache()
+
+    # final_confidence = torch.stack(all_confidences).mean(dim=0) 平均
+    final_confidence = all_confidences[-1] # 最後一次
+    # logging.info(f"final_confidence: {final_confidence}")
+    confidence_normalized = (final_confidence - 0.55) / (0.61 - 0.55)
+    confidence_normalized = torch.clamp(confidence_normalized, 0, 1)
+
     self.last_trans_update = trans_delta
     self.last_rot_update = rot_mat_delta
-
+    # logging.info(f"model: {self.model}")
     if get_vis:
-      logging.info("get_vis...")
+      # logging.info("get_vis...")
       canvas = []
       padding = 2
       pose_data = make_crop_data_batch(self.cfg.input_resize, torch.as_tensor(ob_centered_in_cams), mesh_centered, rgb, depth, K, crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg, glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter)
@@ -290,7 +306,7 @@ class PoseRefinePredictor:
       canvas_refined = make_grid_image(canvas_refined, nrow=1, padding=padding, pad_value=255)
       canvas = make_grid_image([canvas, canvas_refined], nrow=2, padding=padding, pad_value=255)
       torch.cuda.empty_cache()
-      return B_in_cams_out, canvas
+      return B_in_cams_out, confidence_normalized, canvas
 
-    return B_in_cams_out, None
+    return B_in_cams_out, confidence_normalized, None
 

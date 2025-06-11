@@ -113,7 +113,15 @@ def make_mesh_tensors(mesh, device='cuda', max_tex_size=None):
         img = cv2.resize(img, fx=scale, fy=scale, dsize=None)
     mesh_tensors['tex'] = torch.as_tensor(img, device=device, dtype=torch.float)[None]/255.0
     mesh_tensors['uv_idx']  = torch.as_tensor(mesh.faces, device=device, dtype=torch.int)
-    uv = torch.as_tensor(mesh.visual.uv, device=device, dtype=torch.float)
+    # uv = torch.as_tensor(mesh.visual.uv, device=device, dtype=torch.float)
+
+    if mesh.visual.uv is None:
+        print("[WARNING] mesh.visual.uv is None, assigning dummy uv coordinates.")
+        uv = np.zeros((mesh.vertices.shape[0], 2), dtype=np.float32)
+    else:
+        uv = mesh.visual.uv
+    uv = torch.as_tensor(uv, device=device, dtype=torch.float)
+
     uv[:,1] = 1 - uv[:,1]
     mesh_tensors['uv']  = uv
   else:
@@ -748,6 +756,51 @@ def draw_posed_3d_box(K, img, ob_in_cam, bbox, line_color=(0,255,0), linewidth=2
 
   return img
 
+def draw_posed_3d_origin_axis(K, img, ob_in_cam, scale=0.1, thickness=2, is_input_rgb=False):
+  """
+  在影像上繪製物體局部座標系原點的 XYZ 軸，
+  不繪製邊界框。
+  @K: 相機內參矩陣 (3x3)
+  @img: 輸入影像 (BGR或RGB)
+  @ob_in_cam: 物體相對相機的4x4位姿矩陣
+  @scale: 軸長度比例
+  @thickness: 線寬
+  @is_input_rgb: 輸入影像是否為RGB格式，若是會轉成BGR方便OpenCV繪圖
+  """
+  if is_input_rgb:
+      img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+  # 定義局部座標系原點和三軸終點（齊次座標）
+  origin = np.array([0, 0, 0, 1], dtype=np.float32)
+  x_axis = np.array([scale, 0, 0, 1], dtype=np.float32)
+  y_axis = np.array([0, scale, 0, 1], dtype=np.float32)
+  z_axis = np.array([0, 0, scale, 1], dtype=np.float32)
+
+  def project_point(pt_3d, K, pose):
+      # 將3D點投影到影像平面
+      pt_cam = pose @ pt_3d.reshape(4,1)  # 4x1
+      pt_cam = pt_cam[:3,0]
+      pt_img = K @ pt_cam
+      pt_img /= pt_img[2]
+      return (int(pt_img[0]), int(pt_img[1]))
+
+  # 投影點
+  origin_2d = project_point(origin, K, ob_in_cam)
+  x_2d = project_point(x_axis, K, ob_in_cam)
+  y_2d = project_point(y_axis, K, ob_in_cam)
+  z_2d = project_point(z_axis, K, ob_in_cam)
+
+  # 繪製三軸線條（X:藍色, Y:綠色, Z:紅色）
+  img = cv2.line(img, origin_2d, x_2d, (255, 0, 0), thickness, lineType=cv2.LINE_AA)
+  img = cv2.line(img, origin_2d, y_2d, (0, 255, 0), thickness, lineType=cv2.LINE_AA)
+  img = cv2.line(img, origin_2d, z_2d, (0, 0, 255), thickness, lineType=cv2.LINE_AA)
+
+  if is_input_rgb:
+      img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+  return img
+
+
 
 def projection_matrix_from_intrinsics(K, height, width, znear, zfar, window_coords='y_down'):
   """Conversion of Hartley-Zisserman intrinsic matrix to OpenGL proj. matrix.
@@ -922,7 +975,7 @@ class OctreeManager:
     for level in range(self.n_level):
       vox_pts = self.get_level_quantized_points(level)
       corner_pts = self.get_level_corner_quantized_points(level)
-      logging.info(f'level:{level}, vox_pts:{vox_pts.shape}, corner_pts:{corner_pts.shape}')
+      # logging.info(f'level:{level}, vox_pts:{vox_pts.shape}, corner_pts:{corner_pts.shape}')
 
   def get_level_corner_quantized_points(self,level):
     start = self.pyramid_dual[...,1,level]
@@ -949,7 +1002,7 @@ class OctreeManager:
 
   def draw(self,level, method='point'):
     import kaolin
-    logging.info(f"level:{level}")
+    # logging.info(f"level:{level}")
     vox_size = self.get_vox_size_at_level(level)
 
     if method=='point':
