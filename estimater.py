@@ -212,7 +212,7 @@ class FoundationPose:
     # logging.info(f"after viewpoint, add_errs min:{add_errs.min()}")
 
     xyz_map = depth2xyzmap(depth, K)
-    poses, conf, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, xyz_map=xyz_map, glctx=self.glctx, mesh_diameter=self.diameter, iteration=iteration, get_vis=self.debug>=2)
+    poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, xyz_map=xyz_map, glctx=self.glctx, mesh_diameter=self.diameter, iteration=iteration, get_vis=self.debug>=2)
     if vis is not None:
       imageio.imwrite(f'{self.debug_dir}/vis_refiner.png', vis)
 
@@ -228,7 +228,7 @@ class FoundationPose:
     scores = scores[ids]
     poses = poses[ids]
 
-    logging.info(f'sorted scores:{scores}')
+    # logging.info(f'sorted scores:{scores}')
 
     best_pose = poses[0]@self.get_tf_to_centered_mesh()
     self.pose_last = poses[0]
@@ -260,40 +260,12 @@ class FoundationPose:
 
     xyz_map = depth2xyzmap_batch(depth[None], torch.as_tensor(K, dtype=torch.float, device='cuda')[None], zfar=np.inf)[0]
 
-    pose, conf, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=self.pose_last.reshape(1,4,4).data.cpu().numpy(), normal_map=None, xyz_map=xyz_map, mesh_diameter=self.diameter, glctx=self.glctx, iteration=iteration, get_vis=self.debug>=2)
+    pose, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=self.pose_last.reshape(1,4,4).data.cpu().numpy(), normal_map=None, xyz_map=xyz_map, mesh_diameter=self.diameter, glctx=self.glctx, iteration=iteration, get_vis=self.debug>=2)
     # logging.info("pose done")
-    logging.info(f"conf: {conf}")
     if self.debug>=2:
       extra['vis'] = vis
 
-    pose_last_for_score = self.pose_last[0] if self.pose_last.ndim == 3 else self.pose_last
-    score = self.score_pose(torch.as_tensor(pose[0], device='cuda', dtype=torch.float), pose_last_for_score)
-
     # logging.info(f"Pose score: {score:.3f}")
     self.pose_last = pose
-    return (pose@self.get_tf_to_centered_mesh()).data.cpu().numpy().reshape(4,4), conf
-
-  def score_pose(self, pose_est, pose_last):
-    """
-    計算估測結果的分數，結合旋轉差和平移差。
-    """
-    R_est = pose_est[:3, :3]
-    R_last = pose_last[:3, :3]
-
-    # 斷言防呆
-    assert R_est.shape == (3,3), f"R_est shape is {R_est.shape}, expected (3,3)"
-    assert R_last.shape == (3,3), f"R_last shape is {R_last.shape}, expected (3,3)"
-
-    delta_R = R_est @ R_last.transpose(-1, -2)
-    cos_angle = (torch.trace(delta_R) - 1) / 2
-    cos_angle = torch.clamp(cos_angle, -1, 1)
-    angle_diff_deg = torch.rad2deg(torch.arccos(cos_angle))
-
-    t_est = pose_est[:3, 3]
-    t_last = pose_last[:3, 3]
-    trans_diff = torch.norm(t_est - t_last)
-
-    score = angle_diff_deg + trans_diff
-    return score.item()
-
+    return (pose@self.get_tf_to_centered_mesh()).data.cpu().numpy().reshape(4,4)
 

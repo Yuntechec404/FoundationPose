@@ -687,8 +687,8 @@ def draw_xyz_axis(color, ob_in_cam, scale=0.1, K=np.eye(3), thickness=3, transpa
   if is_input_rgb:
     color = cv2.cvtColor(color,cv2.COLOR_RGB2BGR)
   xx = np.array([1,0,0,1]).astype(float)
-  yy = np.array([0,1,0,1]).astype(float)
-  zz = np.array([0,0,1,1]).astype(float)
+  yy = np.array([0,0,1,1]).astype(float)
+  zz = np.array([0,1,0,1]).astype(float)
   xx[:3] = xx[:3]*scale
   yy[:3] = yy[:3]*scale
   zz[:3] = zz[:3]*scale

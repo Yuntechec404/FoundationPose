@@ -55,13 +55,13 @@ def vis_batch_data_scores(pose_data, ids, scores, pad_margin=5):
 
 @torch.no_grad()
 def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_ratio, normal_map=None, mesh_diameter=None, glctx=None, mesh_tensors=None, dataset:TripletH5Dataset=None, cfg=None):
-  logging.info("Welcome make_crop_data_batch")
+  # logging.info("Welcome make_crop_data_batch")
   H,W = depth.shape[:2]
 
   args = []
   method = 'box_3d'
   tf_to_crops = compute_crop_window_tf_batch(pts=mesh.vertices, H=H, W=W, poses=ob_in_cams, K=K, crop_ratio=crop_ratio, out_size=(render_size[1], render_size[0]), method=method, mesh_diameter=mesh_diameter)
-  logging.info("make tf_to_crops done")
+  # logging.info("make tf_to_crops done")
 
   B = len(ob_in_cams)
   poseAs = torch.as_tensor(ob_in_cams, dtype=torch.float, device='cuda')
@@ -84,7 +84,7 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
   rgb_rs = torch.cat(rgb_rs, dim=0).permute(0,3,1,2) * 255
   depth_rs = torch.cat(depth_rs, dim=0).permute(0,3,1,2)
   xyz_map_rs = torch.cat(xyz_map_rs, dim=0).permute(0,3,1,2)  #(B,3,H,W)
-  logging.info("render done")
+  # logging.info("render done")
 
   rgbBs = kornia.geometry.transform.warp_perspective(torch.as_tensor(rgb, dtype=torch.float, device='cuda').permute(2,0,1)[None].expand(B,-1,-1,-1), tf_to_crops, dsize=render_size, mode='bilinear', align_corners=False)
   depthBs = kornia.geometry.transform.warp_perspective(torch.as_tensor(depth, dtype=torch.float, device='cuda')[None,None].expand(B,-1,-1,-1), tf_to_crops, dsize=render_size, mode='nearest', align_corners=False)
@@ -109,7 +109,7 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
   pose_data = BatchPoseData(rgbAs=rgbAs, rgbBs=rgbBs, depthAs=depthAs, depthBs=depthBs, normalAs=normalAs, normalBs=normalBs, poseA=poseAs, xyz_mapAs=xyz_mapAs, tf_to_crops=tf_to_crops, Ks=Ks, mesh_diameters=mesh_diameters)
   pose_data = dataset.transform_batch(pose_data, H_ori=H, W_ori=W, bound=1)
 
-  logging.info("pose batch data done")
+  # logging.info("pose batch data done")
 
   return pose_data
 
@@ -162,14 +162,14 @@ class ScorePredictor:
     '''
     @rgb: np array (H,W,3)
     '''
-    logging.info(f"ob_in_cams:{ob_in_cams.shape}")
+    # logging.info(f"ob_in_cams:{ob_in_cams.shape}")
     ob_in_cams = torch.as_tensor(ob_in_cams, dtype=torch.float, device='cuda')
 
-    logging.info(f'self.cfg.use_normal:{self.cfg.use_normal}')
+    # logging.info(f'self.cfg.use_normal:{self.cfg.use_normal}')
     if not self.cfg.use_normal:
       normal_map = None
 
-    logging.info("making cropped data")
+    # logging.info("making cropped data")
 
     if mesh_tensors is None:
       mesh_tensors = make_mesh_tensors(mesh)
@@ -180,7 +180,7 @@ class ScorePredictor:
     pose_data = make_crop_data_batch(self.cfg.input_resize, ob_in_cams, mesh, rgb, depth, K, crop_ratio=self.cfg['crop_ratio'], glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, cfg=self.cfg, mesh_diameter=mesh_diameter)
 
     def find_best_among_pairs(pose_data:BatchPoseData):
-      logging.info(f'pose_data.rgbAs.shape[0]: {pose_data.rgbAs.shape[0]}')
+      # logging.info(f'pose_data.rgbAs.shape[0]: {pose_data.rgbAs.shape[0]}')
       ids = []
       scores = []
       bs = pose_data.rgbAs.shape[0]
@@ -197,7 +197,7 @@ class ScorePredictor:
         scores.append(scores_cur)
       ids = torch.stack(ids, dim=0).reshape(-1)
       scores = torch.cat(scores, dim=0).reshape(-1)
-      return ids, scores
+      return ids, scores + 100
 
     pose_data_iter = pose_data
     global_ids = torch.arange(len(ob_in_cams), device='cuda', dtype=torch.long)
@@ -206,14 +206,14 @@ class ScorePredictor:
     while 1:
       ids, scores = find_best_among_pairs(pose_data_iter)
       if len(ids)==1:
-        scores_global[global_ids] = scores + 100
+        scores_global[global_ids] = scores
         break
       global_ids = global_ids[ids]
       pose_data_iter = pose_data.select_by_indices(global_ids)
 
     scores = scores_global
 
-    logging.info(f'forward done')
+    # logging.info(f'forward done')
     torch.cuda.empty_cache()
 
     if get_vis:
