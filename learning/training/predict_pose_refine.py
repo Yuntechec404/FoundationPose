@@ -179,13 +179,10 @@ class PoseRefinePredictor:
     if not isinstance(trans_normalizer, float):
       trans_normalizer = torch.as_tensor(list(trans_normalizer), device='cuda', dtype=torch.float).reshape(1,3)
     
-    all_confidences = []
-    
     for _ in range(iteration):
       # logging.info("making cropped data")
       pose_data = make_crop_data_batch(self.cfg.input_resize, B_in_cams, mesh_centered, rgb_tensor, depth_tensor, K, crop_ratio=crop_ratio, normal_map=normal_map, xyz_map=xyz_map_tensor, cfg=self.cfg, glctx=glctx, mesh_tensors=mesh_tensors, dataset=self.dataset, mesh_diameter=mesh_diameter)
       B_in_cams = []
-      confidences_iter = []
       for b in range(0, pose_data.rgbAs.shape[0], bs):
         A = torch.cat([pose_data.rgbAs[b:b+bs].cuda(), pose_data.xyz_mapAs[b:b+bs].cuda()], dim=1).float()
         B = torch.cat([pose_data.rgbBs[b:b+bs].cuda(), pose_data.xyz_mapBs[b:b+bs].cuda()], dim=1).float()
@@ -195,10 +192,6 @@ class PoseRefinePredictor:
         for k in output:
           output[k] = output[k].float()
         # logging.info("forward done")
-
-        # read confidence
-        conf_scores = output.get("confidence", torch.ones(len(A), device=A.device))
-        confidences_iter.append(conf_scores)
 
         if self.cfg['trans_rep']=='tracknet':
           if not self.cfg['normalize_xyz']:
@@ -240,16 +233,9 @@ class PoseRefinePredictor:
         B_in_cams.append(B_in_cam)
 
       B_in_cams = torch.cat(B_in_cams, dim=0).reshape(len(ob_in_cams),4,4)
-      all_confidences.append(torch.cat(confidences_iter, dim=0))  # 迭代的置信度
-
     B_in_cams_out = B_in_cams@torch.tensor(tf_to_center[None], device='cuda', dtype=torch.float)
+    
     torch.cuda.empty_cache()
-
-    # final_confidence = torch.stack(all_confidences).mean(dim=0) 平均
-    final_confidence = all_confidences[-1] # 最後一次
-    # logging.info(f"final_confidence: {final_confidence}")
-    confidence_normalized = (final_confidence - 0.55) / (0.61 - 0.55)
-    confidence_normalized = torch.clamp(confidence_normalized, 0, 1)
 
     self.last_trans_update = trans_delta
     self.last_rot_update = rot_mat_delta
@@ -306,7 +292,7 @@ class PoseRefinePredictor:
       canvas_refined = make_grid_image(canvas_refined, nrow=1, padding=padding, pad_value=255)
       canvas = make_grid_image([canvas, canvas_refined], nrow=2, padding=padding, pad_value=255)
       torch.cuda.empty_cache()
-      return B_in_cams_out, confidence_normalized, canvas
+      return B_in_cams_out, canvas
 
-    return B_in_cams_out, confidence_normalized, None
+    return B_in_cams_out, None
 
