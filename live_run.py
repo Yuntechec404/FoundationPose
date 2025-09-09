@@ -383,7 +383,7 @@ if __name__ == '__main__':
     prefer_cls = None if args.det_class < 0 else int(args.det_class)
     detector = YOLO(args.det_onnx, task='detect')
     is_gpu, yolo_desc = yolo_uses_gpu(detector)
-    logging.info(f"[YOLO] GPU enabled: {is_gpu}  ({yolo_desc})")
+    # logging.info(f"[YOLO] GPU enabled: {is_gpu}  ({yolo_desc})")
 
     #### RealSense 初始化 ####
     image_H = args.image_H
