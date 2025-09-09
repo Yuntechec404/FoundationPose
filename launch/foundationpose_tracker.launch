@@ -1,0 +1,28 @@
+<launch>
+  <node pkg="ros_foundationpose" type="test.py" name="ros_foundationpose" output="screen">
+    <env name="PYTHONPATH" value="/opt/ros/noetic/lib/python3/dist-packages:${PYTHONPATH}"/>
+    <env name="LD_LIBRARY_PATH" value="/opt/ros/noetic/lib:${LD_LIBRARY_PATH}"/>
+    
+    <param name="image_topic" value="/camera/color/image_raw"/>
+    <param name="info_topic" value="/camera/color/camera_info"/>
+    <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw"/>
+    <param name="depth_info_topic" value="/camera/aligned_depth_to_color/camera_info"/>
+    <param name="camera_tf" value="camera_color_optical_frame"/>
+
+    <param name="mesh_file" value="$(find ros_foundationpose)/data/oilpalm/oilpalm.obj"/>
+    <param name="det_onnx" value="$(find ros_foundationpose)/data/oilpalm_pallet.onnx"/>
+    <param name="init_mode" value="yolo"/>
+    <param name="image_H" value="640"/>
+    <param name="image_W" value="480"/>
+    <param name="det_conf" value="0.25"/>
+    <param name="det_class" value="0"/>
+    <param name="est_refine_iter" value="5"/>
+    <param name="track_refine_iter" value="2"/>
+
+    <param name="roi_expand" value="0.01"/>
+    <param name="iou_stride" value="1"/>
+    <param name="iou_log" value="true"/>
+    <param name="iou_thresh" value="0.2"/>
+    <param name="iou_patience" value="3"/>
+   </node>
+</launch>
