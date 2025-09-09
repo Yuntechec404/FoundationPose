@@ -1,0 +1,23 @@
+model:
+  mesh_file: "$(find foundationpose_tracker)/data/oilpalm/oilpalm.obj"
+  det_onnx:  "$(find foundationpose_tracker)/data/oilpalm_pallet.onnx"
+  det_imgsz: 640
+  det_conf: 0.25
+  det_class: 0      # <0 表示不限定
+  roi_expand: 0.01
+  est_refine_iter: 5
+  track_refine_iter: 2
+
+iou:
+  stride: 1
+  thresh: 0.2
+  patience: 2
+  log: false
+
+vis:
+  publish_viz: true
+  viz_topic: "/foundationpose/viz"
+
+runtime:
+  init_mode: "yolo"   # "click" | "yolo"
+  use_gpu: true
