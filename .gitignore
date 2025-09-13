@@ -152,7 +152,5 @@ dmypy.json
 .pyre/
 
 # Datasets
-data/
-logs/
 !BundleTrack/XMem/inference/data
 run_used.yml

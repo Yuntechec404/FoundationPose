@@ -1,28 +1,82 @@
 <launch>
-  <node pkg="ros_foundationpose" type="test.py" name="ros_foundationpose" output="screen">
-    <env name="PYTHONPATH" value="/opt/ros/noetic/lib/python3/dist-packages:${PYTHONPATH}"/>
-    <env name="LD_LIBRARY_PATH" value="/opt/ros/noetic/lib:${LD_LIBRARY_PATH}"/>
-    
-    <param name="image_topic" value="/camera/color/image_raw"/>
-    <param name="info_topic" value="/camera/color/camera_info"/>
-    <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw"/>
-    <param name="depth_info_topic" value="/camera/aligned_depth_to_color/camera_info"/>
-    <param name="camera_tf" value="camera_color_optical_frame"/>
+  <arg name="image_topic"       default="/camera/color/image_raw"/> <!-- Topics / Frames 設定 -->
+  <arg name="info_topic"        default="/camera/color/camera_info"/> <!-- RGB 影像與相機內參 -->
+  <arg name="depth_topic"       default="/camera/aligned_depth_to_color/image_raw"/> <!-- 與RGB對齊的深度影像與相機內參 -->
+  <arg name="depth_info_topic"  default="/camera/aligned_depth_to_color/camera_info"/>
+  <arg name="camera_tf"         default="camera_color_optical_frame"/> <!-- 追蹤結果所對應的parent frame -->
+  <arg name="object_name"       default="oilpalm"/> <!-- 追蹤到的物件名稱 TF child frame；Pose的topic -->
 
-    <param name="mesh_file" value="$(find ros_foundationpose)/data/oilpalm/oilpalm.obj"/>
-    <param name="det_onnx" value="$(find ros_foundationpose)/data/oilpalm_pallet.onnx"/>
-    <param name="init_mode" value="yolo"/>
-    <param name="image_H" value="640"/>
-    <param name="image_W" value="480"/>
-    <param name="det_conf" value="0.25"/>
-    <param name="det_class" value="0"/>
-    <param name="est_refine_iter" value="5"/>
-    <param name="track_refine_iter" value="2"/>
+  <arg name="det_onnx"          default="$(find ros_foundationpose)/data/oilpalm_pallet.onnx"/> <!-- 物件偵測（ONNX） -->
+  <arg name="mesh_file"         default="$(find ros_foundationpose)/data/oilpalm/oilpalm.obj"/> <!-- 3D mesh（.obj） -->
+  <arg name="debug_dir"         default="$(find ros_foundationpose)/log"/> <!-- 偵錯/紀錄輸出目錄 -->
 
-    <param name="roi_expand" value="0.01"/>
-    <param name="iou_stride" value="1"/>
-    <param name="iou_log" value="true"/>
-    <param name="iou_thresh" value="0.2"/>
-    <param name="iou_patience" value="3"/>
-   </node>
+  <arg name="init_mode"         default="yolo"/> <!-- 初始化方式：yolo or click -->
+
+  <arg name="det_conf"          default="0.25"/>  <!-- yolo信心門檻 -->
+  <arg name="det_class"         default="-1"/>    <!-- 指定類別；-1 表不限 -->
+  <arg name="det_imgsz"         default="640"/>   <!-- yolo輸入尺寸 -->
+  <arg name="det_select_mode"   default="score"/> <!-- 偵測框挑選模式：score / top / bottom -->
+
+  <arg name="est_refine_iter"   default="5"/>     <!-- 初始register迭代 -->
+  <arg name="track_refine_iter" default="2"/>     <!-- 追蹤refine迭代 -->
+
+  <arg name="roi_expand"        default="0.01"/>  <!-- 以偵測框為中心擴張 ROI 的比例 -->
+  <arg name="iou_stride"        default="1"/>     <!-- 每N幀計算一次YOLO vs 估測框 IoU -->
+  <arg name="iou_log"           default="false"/> <!-- 是否在log輸出IoU -->
+  <arg name="iou_thresh"        default="0.2"/>   <!-- IoU門檻（過低觸發重新初始化） -->
+  <arg name="iou_patience"      default="3"/>     <!-- 連續幾幀低於門檻才重新初始化 -->
+
+  <arg name="show_depth_window" default="false"/> <!-- 顯示depth視窗；可在執行中按D切換 -->
+  <arg name="show_rgb_window"   default="true"/> <!-- 顯示RGB視窗；可在執行中按R切換 -->
+  <arg name="depth_win_name"    default="Depth"/> <!-- 視窗標題 -->
+  <arg name="rgb_win_name"      default="RGB"/> <!-- 視窗標題 -->
+  <arg name="depth_window_xy"   default="[100, 100]"/> <!-- 視窗初始位置（像素；[x, y]） -->
+  <arg name="rgb_window_xy"     default="[100, 500]"/> <!-- 視窗初始位置（像素；[x, y]） -->
+  <arg name="max_depth_mm"      default="2000.0"/> <!-- 深度可視化：0~max_depth_mm映射為灰階0~255再上colormap -->
+  <arg name="colormap"          default="2"/> <!-- 依 OpenCV colormap 常數（例如：COLORMAP_JET=2）；可自行替換 -->
+  <arg name="invert_colormap"   default="false"/> <!-- 是否反相（近亮遠暗/或相反） -->
+
+  <!-- <node pkg="rviz" type="rviz" name="$(anon rviz)" respawn="false" output="screen" args="-d $(find ros_foundationpose)/rviz/foundationpose.rviz"/> -->
+
+  <node pkg="ros_foundationpose" type="foundationpose_tracker.py" name="foundationpose_tracker" output="screen">
+    <!-- Topics / Frames -->
+    <param name="image_topic"        value="$(arg image_topic)"/>
+    <param name="info_topic"         value="$(arg info_topic)"/>
+    <param name="depth_topic"        value="$(arg depth_topic)"/>
+    <param name="depth_info_topic"   value="$(arg depth_info_topic)"/>
+    <param name="camera_tf"          value="$(arg camera_tf)"/>
+    <param name="object_name"        value="$(arg object_name)"/>
+
+    <!-- 模型 / 檔案 -->
+    <param name="det_onnx"           value="$(arg det_onnx)"/>
+    <param name="mesh_file"          value="$(arg mesh_file)"/>
+    <param name="debug_dir"          value="$(arg debug_dir)"/>
+
+    <!-- 模式 / 演算法 -->
+    <param name="init_mode"          value="$(arg init_mode)"/>
+    <param name="det_conf"           value="$(arg det_conf)"/>
+    <param name="det_class"          value="$(arg det_class)"/>
+    <param name="det_imgsz"          value="$(arg det_imgsz)"/>
+    <param name="det_select_mode"    value="$(arg det_select_mode)"/>
+    <param name="est_refine_iter"    value="$(arg est_refine_iter)"/>
+    <param name="track_refine_iter"  value="$(arg track_refine_iter)"/>
+
+    <!-- 追蹤 / IoU -->
+    <param name="roi_expand"         value="$(arg roi_expand)"/>
+    <param name="iou_stride"         value="$(arg iou_stride)"/>
+    <param name="iou_log"            value="$(arg iou_log)"/>
+    <param name="iou_thresh"         value="$(arg iou_thresh)"/>
+    <param name="iou_patience"       value="$(arg iou_patience)"/>
+
+    <!-- 視覺化 / 介面 -->
+    <param name="show_depth_window"  value="$(arg show_depth_window)"/>
+    <param name="show_rgb_window"    value="$(arg show_rgb_window)"/>
+    <param name="depth_win_name"     value="$(arg depth_win_name)"/>
+    <param name="rgb_win_name"       value="$(arg rgb_win_name)"/>
+    <param name="depth_window_xy"    value="$(arg depth_window_xy)" type="yaml"/>
+    <param name="rgb_window_xy"      value="$(arg rgb_window_xy)" type="yaml"/>
+    <param name="max_depth_mm"       value="$(arg max_depth_mm)"/>
+    <param name="colormap"           value="$(arg colormap)"/>
+    <param name="invert_colormap"    value="$(arg invert_colormap)"/>
+  </node>
 </launch>
