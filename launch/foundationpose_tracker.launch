@@ -6,14 +6,14 @@
   <arg name="camera_tf"         default="camera_color_optical_frame"/> <!-- 追蹤結果所對應的parent frame -->
   <arg name="object_name"       default="oilpalm"/> <!-- 追蹤到的物件名稱 TF child frame；Pose的topic -->
 
-  <arg name="det_onnx"          default="$(find ros_foundationpose)/data/oilpalm_pallet.onnx"/> <!-- 物件偵測（ONNX） -->
+  <arg name="det_model"         default="$(find ros_foundationpose)/data/oilpalm_pallet.pt"/> <!-- 物件偵測（.onnx/.pt） -->
   <arg name="mesh_file"         default="$(find ros_foundationpose)/data/oilpalm/oilpalm.obj"/> <!-- 3D mesh（.obj） -->
   <arg name="debug_dir"         default="$(find ros_foundationpose)/log"/> <!-- 偵錯/紀錄輸出目錄 -->
 
   <arg name="init_mode"         default="yolo"/> <!-- 初始化方式：yolo or click -->
 
   <arg name="det_conf"          default="0.25"/>  <!-- yolo信心門檻 -->
-  <arg name="det_class"         default="-1"/>    <!-- 指定類別；-1 表不限 -->
+  <arg name="det_class"         default="0"/>    <!-- 指定類別；-1 表不限 -->
   <arg name="det_imgsz"         default="640"/>   <!-- yolo輸入尺寸 -->
   <arg name="det_select_mode"   default="score"/> <!-- 偵測框挑選模式：score / top / bottom -->
 
@@ -23,7 +23,7 @@
   <arg name="roi_expand"        default="0.01"/>  <!-- 以偵測框為中心擴張 ROI 的比例 -->
   <arg name="iou_stride"        default="1"/>     <!-- 每N幀計算一次YOLO vs 估測框 IoU -->
   <arg name="iou_log"           default="false"/> <!-- 是否在log輸出IoU -->
-  <arg name="iou_thresh"        default="0.2"/>   <!-- IoU門檻（過低觸發重新初始化） -->
+  <arg name="iou_thresh"        default="0.25"/>   <!-- IoU門檻（過低觸發重新初始化） -->
   <arg name="iou_patience"      default="3"/>     <!-- 連續幾幀低於門檻才重新初始化 -->
 
   <arg name="show_depth_window" default="false"/> <!-- 顯示depth視窗；可在執行中按D切換 -->
@@ -48,7 +48,7 @@
     <param name="object_name"        value="$(arg object_name)"/>
 
     <!-- 模型 / 檔案 -->
-    <param name="det_onnx"           value="$(arg det_onnx)"/>
+    <param name="det_model"          value="$(arg det_model)"/>
     <param name="mesh_file"          value="$(arg mesh_file)"/>
     <param name="debug_dir"          value="$(arg debug_dir)"/>
 

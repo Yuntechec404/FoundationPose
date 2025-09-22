@@ -1,7 +1,8 @@
-#!/usr/bin/env python3
+#!/home/user/anaconda3/envs/foundationpose/bin/python3
 # -*- coding: utf-8 -*-
 
 import os, sys
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 指定使用哪一個GPU
 import rospy
 import numpy as np
 import cv2
@@ -33,6 +34,10 @@ box_points = []
 class FoundationPoseTracker:
     def __init__(self):
         self.init_parameter()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         self.bridge = CvBridge()
         self.color = None
         self.depth = None
@@ -78,9 +83,10 @@ class FoundationPoseTracker:
         self.est = FoundationPose(model_pts=self.mesh.vertices, model_normals=self.mesh.vertex_normals, mesh=self.mesh, scorer=self.scorer, refiner=self.refiner, debug_dir=self.debug_dir, debug=0, glctx=self.glctx,)
         rospy.loginfo("Estimator initialization done")
 
-        self.detector = YOLO(self.det_onnx, task='detect')
+        self.detector, self.det_device = self.load_detector(self.det_model)
         is_gpu, yolo_desc = self.yolo_uses_gpu(self.detector)
         rospy.loginfo(f"[YOLO] GPU enabled: {is_gpu}  ({yolo_desc})")
+        rospy.loginfo(f"[YOLO] predict device hint: {self.det_device}")
         rospy.loginfo("Detector initialization done")
 
     def init_parameter(self):
@@ -96,7 +102,7 @@ class FoundationPoseTracker:
         self.object_name = gp("object_name", "tracked_object")
 
         self.mesh_file = gp("mesh_file", "")
-        self.det_onnx = gp("det_onnx", "yolov10n.onnx")
+        self.det_model = gp("det_model", "yolov11n.onnx")
         self.init_mode = gp("init_mode", "yolo")
         self.det_conf = float(gp("det_conf", 0.25))
         self.det_class = int(gp("det_class", -1))
@@ -190,6 +196,125 @@ class FoundationPoseTracker:
 
         return False, f"engine={eng or 'unknown'} providers={prov or 'None'} device={dev or 'None'}"
 
+    def load_detector(self, model_path: str):
+        """
+        載入偵測模型（僅支援 .pt / .onnx）
+        規則：
+          - .pt：優先 GPU（model.to('cuda') / predict(device=0)），失敗則 CPU；若載入本身失敗且旁邊有同名 .onnx，切到 .onnx
+          - .onnx：優先 CUDAExecutionProvider，失敗則 CPUExecutionProvider
+        回傳: (detector, det_device_str)
+           det_device_str 會給 predict() 當 device 參數（對 .pt 有效；.onnx 會被忽略）
+        """
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(f"detector model not found: {model_path}")
+
+        def _onnx_sibling(p):
+            stem, ext = os.path.splitext(p)
+            return stem + ".onnx"
+
+        ext = os.path.splitext(model_path)[1].lower()
+        det_device = "cpu"
+
+        if ext == ".pt":
+            rospy.loginfo(f"[YOLO Loader] Loading PyTorch (.pt): {model_path}")
+            # 先試 GPU
+            try:
+                det = YOLO(model_path)   # 會自動推斷任務
+                if torch.cuda.is_available():
+                    try:
+                        det.to("cuda:0")
+                        det_device = 0  # predict(device=0)
+                        rospy.loginfo("[YOLO Loader] PT on GPU OK")
+                        return det, det_device
+                    except Exception as ge:
+                        rospy.logwarn(f"[YOLO Loader] PT move to GPU failed: {ge}. Will try PT on CPU.")
+                else:
+                    rospy.logwarn("[YOLO Loader] No CUDA available; PT will run on CPU.")
+                # 再試 CPU
+                try:
+                    det.to("cpu")
+                    det_device = "cpu"
+                    rospy.loginfo("[YOLO Loader] PT on CPU OK")
+                    return det, det_device
+                except Exception as ce:
+                    rospy.logwarn(f"[YOLO Loader] PT on CPU failed: {ce}")
+
+            except Exception as e:
+                rospy.logwarn(f"[YOLO Loader] PT load failed: {e}")
+
+            # 到這裡表示 .pt 失敗，若旁邊有同名 .onnx 就用它
+            onnx_fallback = _onnx_sibling(model_path)
+            if os.path.isfile(onnx_fallback):
+                rospy.loginfo(f"[YOLO Loader] Trying fallback ONNX: {onnx_fallback}")
+                det, det_device = self._load_onnx_with_gpu_fallback(onnx_fallback)
+                return det, det_device
+            else:
+                raise RuntimeError(f"Failed to load PT '{model_path}' and no sibling ONNX found.\n"
+                                    "Hint: 這通常是 .pt 與 ultralytics 版本不相容；請改用 .onnx 或調整 ultralytics 版本。")
+        elif ext == ".onnx":
+            rospy.loginfo(f"[YOLO Loader] Loading ONNX: {model_path}")
+            det, det_device = self._load_onnx_with_gpu_fallback(model_path)
+            return det, det_device
+        else:
+            raise ValueError(f"Unsupported detector extension: {ext}. Use .pt or .onnx")
+        
+    def _load_onnx_with_gpu_fallback(self, onnx_path: str):
+        """
+        優先用 CUDAExecutionProvider；若不可用或失敗則改 CPUExecutionProvider。
+        回傳: (detector, det_device_str)；對 ONNX 來說 det_device_str 只是提示字串。
+        """
+        # 先照常載入
+        det = YOLO(onnx_path, task="detect")
+
+        # 嘗試檢查/切換 providers
+        sess = None
+        for attr in ("session", "ort_session", "session_ort"):
+            s = getattr(det.model, attr, None)
+            if s is not None:
+                sess = s
+                break
+
+        # 預設提示
+        det_device = "cpu(ORT)"
+
+        if sess is not None:
+            try:
+                provs = list(sess.get_providers())
+            except Exception:
+                provs = []
+
+            # 若已經有 CUDA provider 就直接用
+            if "CUDAExecutionProvider" in provs:
+                rospy.loginfo(f"[YOLO Loader] ONNX providers={provs} (GPU OK)")
+                det_device = "cuda(ORT)"
+                return det, det_device
+
+            # 沒有 CUDA provider → 試著設定成 GPU，再不行用 CPU
+            try:
+                sess.set_providers(["CUDAExecutionProvider", "CPUExecutionProvider"])
+                provs2 = list(sess.get_providers())
+                if "CUDAExecutionProvider" in provs2:
+                    rospy.loginfo(f"[YOLO Loader] ONNX switched to providers={provs2} (GPU OK)")
+                    det_device = "cuda(ORT)"
+                    return det, det_device
+                else:
+                    rospy.logwarn(f"[YOLO Loader] ONNX CUDA provider not available, using CPU providers={provs2}")
+            except Exception as ge:
+                rospy.logwarn(f"[YOLO Loader] ONNX set_providers to CUDA failed: {ge}. Will use CPUExecutionProvider.")
+
+            # 最後：CPU
+            try:
+                sess.set_providers(["CPUExecutionProvider"])
+            except Exception:
+                pass
+            rospy.loginfo("[YOLO Loader] ONNX on CPUExecutionProvider")
+            det_device = "cpu(ORT)"
+            return det, det_device
+
+        # 如果拿不到 session，就照預設（Ultralytics 內部會自己決定）
+        rospy.logwarn("[YOLO Loader] ONNX session not exposed; provider control skipped.")
+        return det, det_device
+
     # =========================
     # 偵測 / BBox / 幾何工具
     # =========================
@@ -235,7 +360,7 @@ class FoundationPoseTracker:
         - 'bottom':最靠下 (y2 最大)
         會先以conf做門檻過濾；若有prefer_cls，會再以類別過濾。
         """
-        r = detector.predict(source=img_bgr, imgsz=imgsz, conf=conf, verbose=False)[0]
+        r = detector.predict(source=img_bgr, imgsz=imgsz, conf=conf, device=self.det_device, verbose=False)[0]
         if len(r.boxes) == 0:
             return None, 0.0, None
 
@@ -277,7 +402,7 @@ class FoundationPoseTracker:
         cl:   (N,)  int32
         若沒有偵測，三者皆為長度 0 的陣列。
         """
-        r = detector.predict(source=img_bgr, imgsz=imgsz, conf=conf, verbose=False)[0]
+        r = detector.predict(source=img_bgr, imgsz=imgsz, conf=conf, device=self.det_device, verbose=False)[0]
         if len(r.boxes) == 0:
             return (np.empty((0, 4), dtype=np.float32),
                     np.empty((0,), dtype=np.float32),
@@ -312,22 +437,21 @@ class FoundationPoseTracker:
     selecting_bbox = False
 
     def _open_window(self, name, pos_xy, init_size, is_rgb=True):
-        # 若已存在先砍掉（避免前次殘留大小）
+        w, h = init_size
         try:
             cv2.destroyWindow(name)
         except Exception:
             pass
         cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(name, int(w), int(h))
         cv2.moveWindow(name, int(pos_xy[0]), int(pos_xy[1]))
-        # 先標為「尚未設定尺寸」，等第一張 imshow 後再 resize（更穩）
+
         if is_rgb:
             self._rgb_win_created = True
             self._rgb_win_sized = False
-            self._rgb_initial_size = init_size
         else:
             self._depth_win_created = True
             self._depth_win_sized = False
-            self._depth_initial_size = init_size
 
     def _close_window(self, name, is_rgb=True):
         try:
@@ -347,7 +471,49 @@ class FoundationPoseTracker:
         if self.show_depth_win and not self._depth_win_created:
             self._open_window(self.depth_win_name, self.depth_win_xy, self._depth_initial_size, is_rgb=False)
 
-    def ensure_window(self, name, xy, size=(1272, 720)):
+    def pump_windows(self, rgb_frame=None, depth_frame=None):
+        """統一處理視窗建立/移動/縮放/顯示/事件，確保即使尚未偵測也會持續更新。"""
+        # 先確保 window 存在
+        if self.show_rgb_win and not self._rgb_win_created:
+            self._open_window(self.rgb_win_name, self.rgb_win_xy, self._rgb_initial_size, is_rgb=True)
+        if self.show_depth_win and not self._depth_win_created:
+            self._open_window(self.depth_win_name, self.depth_win_xy, self._depth_initial_size, is_rgb=False)
+
+        # 若沒給影像，用空畫面頂住，避免 GUI 停住
+        if rgb_frame is None and self.show_rgb_win:
+            rgb_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            cv2.putText(rgb_frame, "Waiting for detection / click init...", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+        if depth_frame is None and self.show_depth_win:
+            depth_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        # 顯示 + 初始定位/尺寸（確保 move/resize 真的跑到）
+        if self.show_rgb_win and rgb_frame is not None:
+            cv2.imshow(self.rgb_win_name, rgb_frame)
+            if not self._rgb_win_sized:
+                w, h = self._rgb_initial_size
+                cv2.resizeWindow(self.rgb_win_name, int(w), int(h))
+                cv2.moveWindow(self.rgb_win_name, int(self.rgb_win_xy[0]), int(self.rgb_win_xy[1]))
+                self._rgb_win_sized = True
+
+        if self.show_depth_win and depth_frame is not None:
+            cv2.imshow(self.depth_win_name, depth_frame)
+            if not self._depth_win_sized:
+                w, h = self._depth_initial_size
+                cv2.resizeWindow(self.depth_win_name, int(w), int(h))
+                cv2.moveWindow(self.depth_win_name, int(self.depth_win_xy[0]), int(self.depth_win_xy[1]))
+                self._depth_win_sized = True
+
+        # 永遠跑 waitKey 讓 GUI 有事件循環
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            rospy.signal_shutdown("user quit")
+        elif key == ord('d'):
+            self.toggle_depth_window()
+        elif key == ord('r'):
+            self.toggle_rgb_window()
+        
+    def ensure_window(self, name, xy, size=(900, 720)):
         try:
             cv2.getWindowProperty(name, 0)  # 會丟例外代表視窗不存在
         except cv2.error:
@@ -399,21 +565,15 @@ class FoundationPoseTracker:
         # 階段1：等第一點
         if len(box_points) < 1:
             display_img = color.copy()
-            cv2.imshow(self.rgb_win_name, display_img)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                rospy.loginfo("Exit")
-                exit()
+            self.pump_windows(display_img, self.depth_vis if self.got_depth else None)
             return False
 
-        # 階段2：凍結畫面，等第二點
+        # 階段2：等第二點
         elif len(box_points) < 2:
             display_img = color.copy()
             for pt in box_points:
                 cv2.circle(display_img, pt, radius=5, color=(0, 255, 0), thickness=-1)
-            cv2.imshow(self.rgb_win_name, display_img)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                rospy.loginfo("Exit")
-                exit()
+            self.pump_windows(display_img, self.depth_vis if self.got_depth else None)
             return False
 
         # 完成
@@ -461,8 +621,7 @@ class FoundationPoseTracker:
         if det_xyxy is None:
             vis = color.copy()
             cv2.putText(vis, "YOLO ROI not found - waiting...", (20, 40),cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
-            cv2.imshow(self.rgb_win_name, vis)
-            cv2.waitKey(1)
+            self.pump_windows(vis, self.depth_vis if self.got_depth else None)
             return None, None, None, None
 
         det_xyxy = self.clip_xyxy(det_xyxy, W, H)
@@ -474,8 +633,7 @@ class FoundationPoseTracker:
         x1, y1, x2, y2 = det_xyxy.astype(int)
         cv2.rectangle(init_vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.putText(init_vis, f"INIT ROI s={det_score:.2f}", (x1, max(0, y1 - 8)),cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-        cv2.imshow(self.rgb_win_name, init_vis)
-        cv2.waitKey(1)
+        self.pump_windows(init_vis, self.depth_vis if self.got_depth else None)
         return pose, mask, det_xyxy, det_score
 
     def periodic_yolo_iou(self, frame_count, stride, detector, color, center_pose, bbox_minmax, K,
@@ -503,7 +661,7 @@ class FoundationPoseTracker:
         if len(xyxy_all) == 0:
             cv2.putText(vis_bgr, "YOLO det=0", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
-            return vis_bgr, iou_val
+            return vis_bgr, 0.0
         
         # 若有指定 prefer_cls，且該類別有偵測，僅在該類別中挑；否則全體比較
         use_mask = np.ones(len(xyxy_all), dtype=bool)
@@ -629,7 +787,8 @@ class FoundationPoseTracker:
         first_frame = True
         while not rospy.is_shutdown():
             if not (self.got_depth and self.got_rgb and self.K is not None and hasattr(self, "depth_m")):
-                rospy.sleep(0.1)
+                self.pump_windows(self.color if self.got_rgb else None, self.depth_vis if self.got_depth else None)
+                rospy.sleep(0.01)
                 continue
 
             self.frame_count += 1
@@ -707,45 +866,9 @@ class FoundationPoseTracker:
                 if self.got_depth and self.got_rgb:
                     if self.depth_size != self.rgb_size:
                         rospy.logwarn_throttle(2.0, "Depth and RGB image sizes differ: depth=%s rgb=%s", str(self.depth_size), str(self.rgb_size))
-
-            if self.got_depth and self.show_depth_win and self.depth_vis is not None:
-                if not self._depth_win_created:
-                    self._open_window(self.depth_win_name, self.depth_win_xy, self._depth_initial_size, is_rgb=False)
-                cv2.imshow(self.depth_win_name, self.depth_vis)
-                if not self._depth_win_sized:
-                    w, h = self._depth_initial_size
-                    cv2.resizeWindow(self.depth_win_name, int(w), int(h))
-                    cv2.moveWindow(self.depth_win_name, int(self.depth_win_xy[0]), int(self.depth_win_xy[1]))
-                    self._depth_win_sized = True
             
-            if self.got_rgb and self.show_rgb_win and self.color is not None:
-                if not self._rgb_win_created:
-                    self._open_window(self.rgb_win_name, self.rgb_win_xy, self._rgb_initial_size, is_rgb=True)
-                cv2.imshow(self.rgb_win_name, vis_bgr)
-                if not self._rgb_win_sized:
-                    w, h = self._rgb_initial_size
-                    cv2.resizeWindow(self.rgb_win_name, int(w), int(h))
-                    cv2.moveWindow(self.rgb_win_name, int(self.rgb_win_xy[0]), int(self.rgb_win_xy[1]))
-                    self._rgb_win_sized = True
-            
-            if self.show_depth_win or self.show_rgb_win:
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    rospy.signal_shutdown("user quit")
-
-                elif key == ord('d'):  # 切換深度視窗
-                    self.show_depth_win = not self.show_depth_win
-                    if not self.show_depth_win and self._depth_win_created:
-                        self._close_window(self.depth_win_name, is_rgb=False)
-                    elif self.show_depth_win and not self._depth_win_created:
-                        self._open_window(self.depth_win_name, self.depth_win_xy, self._depth_initial_size, is_rgb=False)
-
-                elif key == ord('r'):  # 切換RGB視窗
-                    self.show_rgb_win = not self.show_rgb_win
-                    if not self.show_rgb_win and self._rgb_win_created:
-                        self._close_window(self.rgb_win_name, is_rgb=True)
-                    elif self.show_rgb_win and not self._rgb_win_created:
-                        self._open_window(self.rgb_win_name, self.rgb_win_xy, self._rgb_initial_size, is_rgb=True)
+            self.pump_windows(vis_bgr if (self.show_rgb_win and self.color is not None) else None,
+                              self.depth_vis if (self.show_depth_win and self.got_depth and self.depth_vis is not None) else None)
             if self.iou_val is not None:
                 self.confidence_publish(float(self.iou_val), not first_frame)
             else:
