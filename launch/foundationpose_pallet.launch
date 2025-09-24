@@ -4,16 +4,17 @@
   <arg name="depth_topic"       default="/camera/aligned_depth_to_color/image_raw"/> <!-- 與RGB對齊的深度影像與相機內參 -->
   <arg name="depth_info_topic"  default="/camera/aligned_depth_to_color/camera_info"/>
   <arg name="camera_tf"         default="camera_color_optical_frame"/> <!-- 追蹤結果所對應的parent frame -->
-  <arg name="object_name"       default="oilpalm"/> <!-- 追蹤到的物件名稱 TF child frame；Pose的topic -->
+  <arg name="object_name"       default="pallet"/> <!-- 追蹤到的物件名稱 TF child frame；Pose的topic -->
 
   <arg name="det_model"         default="$(find ros_foundationpose)/data/oilpalm_pallet.pt"/> <!-- 物件偵測（.onnx/.pt） -->
-  <arg name="mesh_file"         default="$(find ros_foundationpose)/data/oilpalm/oilpalm.obj"/> <!-- 3D mesh（.obj） -->
+  <arg name="mesh_file"         default="$(find ros_foundationpose)/data/pallet/pallet.obj"/> <!-- 3D mesh（.obj） -->
   <arg name="debug_dir"         default="$(find ros_foundationpose)/log"/> <!-- 偵錯/紀錄輸出目錄 -->
 
-  <arg name="init_mode"         default="yolo"/> <!-- 初始化方式：yolo or click -->
+  <arg name="init_mode"         default="yolo"/> <!-- 初始化方式： yolo or click -->
+  <arg name="yolo_start_mode"   default="wait"/> <!-- yolo初始化時機： immediate / wait -->
 
   <arg name="det_conf"          default="0.25"/>  <!-- yolo信心門檻 -->
-  <arg name="det_class"         default="0"/>    <!-- 指定類別；-1 表不限 -->
+  <arg name="det_class"         default="1"/>    <!-- 指定類別；-1 表不限 -->
   <arg name="det_imgsz"         default="640"/>   <!-- yolo輸入尺寸 -->
   <arg name="det_select_mode"   default="score"/> <!-- 偵測框挑選模式：score / top / bottom -->
 
@@ -54,6 +55,7 @@
 
     <!-- 模式 / 演算法 -->
     <param name="init_mode"          value="$(arg init_mode)"/>
+    <param name="yolo_start_mode"    value="$(arg yolo_start_mode)"/>
     <param name="det_conf"           value="$(arg det_conf)"/>
     <param name="det_class"          value="$(arg det_class)"/>
     <param name="det_imgsz"          value="$(arg det_imgsz)"/>

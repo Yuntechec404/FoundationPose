@@ -13,6 +13,7 @@ from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import Pose, PoseStamped, Transform
 from cv_bridge import CvBridge
 from ros_foundationpose.msg import Confidence
+from forklift_server.msg import Detection
 
 from collections import deque
 import tf
@@ -68,6 +69,10 @@ class FoundationPoseTracker:
         self.tf_broadcaster = tf.TransformBroadcaster()
         self.pose_pub = rospy.Publisher(self.object_name, Pose, queue_size=1, latch=True)
         self.conf_pub = rospy.Publisher(self.object_name + "_confidence", Confidence, queue_size=1, latch=True)
+        
+        if self.yolo_start_mode == "wait":
+            self._ready_sub = rospy.Subscriber(self.object_name + "_detection", Detection, self.detectionCallback, queue_size=1)
+                    
         self.window_create()
 
         # foundationpose初始化
@@ -104,6 +109,7 @@ class FoundationPoseTracker:
         self.mesh_file = gp("mesh_file", "")
         self.det_model = gp("det_model", "yolov11n.onnx")
         self.init_mode = gp("init_mode", "yolo")
+        self.yolo_start_mode = gp("yolo_start_mode", "immediate").strip().lower()
         self.det_conf = float(gp("det_conf", 0.25))
         self.det_class = int(gp("det_class", -1))
         self.est_refine_iter = int(gp("est_refine_iter", 5))
@@ -774,6 +780,18 @@ class FoundationPoseTracker:
         self.got_depth = True
         self.depth_size = (self.depth_vis.shape[1], self.depth_vis.shape[0])
 
+    def detectionCallback(self, msg: Detection):
+        self.ready_received.detection_allowed = msg.detection_allowed
+        self.ready_received.layer = msg.layer
+        if msg.layer == 0.0:
+            self.det_select_mode = "score"
+        elif msg.layer == 1.0:
+            self.det_select_mode = "bottom"
+        elif msg.layer == 2.0:
+            self.det_select_mode = "top"
+        else:
+            self.det_select_mode = "score"
+
     def confidence_publish(self, score: float, detection: bool):
         conf_msg = Confidence()
         conf_msg.stamp = rospy.Time.now()
@@ -785,10 +803,30 @@ class FoundationPoseTracker:
     def spin(self):
         self.frame_count = 0
         first_frame = True
+        self.ready_received = Detection()
+        self.ready_received.detection_allowed = False
+        self.ready_received.layer = 0.0
         while not rospy.is_shutdown():
             if not (self.got_depth and self.got_rgb and self.K is not None and hasattr(self, "depth_m")):
                 self.pump_windows(self.color if self.got_rgb else None, self.depth_vis if self.got_depth else None)
                 rospy.sleep(0.01)
+                continue
+
+            if (self.init_mode == 'yolo' and self.yolo_start_mode == 'wait' and not self.ready_received.detection_allowed):
+                self.pose = None
+                first_frame = True
+                self.iou_bad_count = 0
+                self.iou_val = None
+
+                # 視窗上顯示暫停提示
+                vis_rgb = self.color.copy() if self.color is not None else np.zeros((480,640,3), np.uint8)
+                cv2.putText(vis_rgb, "DETECTION DISABLED", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+                self.pump_windows(vis_rgb if self.show_rgb_win else None,
+                                self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
+
+                # 發布信心為 0
+                self.confidence_publish(0.0, False)
                 continue
 
             self.frame_count += 1
