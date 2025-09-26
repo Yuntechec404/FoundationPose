@@ -224,7 +224,7 @@ class FoundationPose:
     # logging.info(f"final, add_errs min:{add_errs.min()}")
 
     ids = torch.as_tensor(scores).argsort(descending=True)
-    # logging.info(f'sort ids:{ids}')
+    # logging.info(f'sort ids:{ids}') # pose index after refinement ------------------------
     scores = scores[ids]
     poses = poses[ids]
 
