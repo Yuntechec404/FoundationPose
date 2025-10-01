@@ -1,0 +1,87 @@
+Re-run cmake no build system arguments
+-- The C compiler identification is GNU 9.4.0
+-- The CXX compiler identification is GNU 9.4.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+CMake Warning (dev) at CMakeLists.txt:10 (find_package):
+  Policy CMP0167 is not set: The FindBoost module is removed.  Run "cmake
+  --help-policy CMP0167" for policy details.  Use the cmake_policy command to
+  set the policy and suppress this warning.
+
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+-- Found Boost: /usr/lib/x86_64-linux-gnu/cmake/Boost-1.71.0/BoostConfig.cmake (found version "1.71.0") found components: system program_options
+-- Found OpenMP_C: -fopenmp (found version "4.5")
+-- Found OpenMP_CXX: -fopenmp (found version "4.5")
+-- Found OpenMP: TRUE (found version "4.5")
+CMake Warning (dev) at /home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages/pybind11/share/cmake/pybind11/FindPythonLibsNew.cmake:101 (message):
+  Policy CMP0148 is not set: The FindPythonInterp and FindPythonLibs modules
+  are removed.  Run "cmake --help-policy CMP0148" for policy details.  Use
+  the cmake_policy command to set the policy and suppress this warning, or
+  preferably upgrade to using FindPython, either by calling it explicitly
+  before pybind11, or by setting PYBIND11_FINDPYTHON ON before pybind11.
+Call Stack (most recent call first):
+  /home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages/pybind11/share/cmake/pybind11/pybind11Tools.cmake:50 (find_package)
+  /home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages/pybind11/share/cmake/pybind11/pybind11Common.cmake:192 (include)
+  /home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages/pybind11/share/cmake/pybind11/pybind11Config.cmake:250 (include)
+  CMakeLists.txt:13 (find_package)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+-- Found PythonInterp: /home/user/anaconda3/envs/foundationpose/bin/python (found suitable version "3.8.20", minimum required is "3.6")
+-- Found PythonLibs: /home/user/anaconda3/envs/foundationpose/lib/libpython3.8.so
+-- Performing Test HAS_FLTO
+-- Performing Test HAS_FLTO - Success
+-- Found pybind11: /home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages/pybind11/include (found version "2.12.0")
+-- Configuring done (0.6s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/user/FoundationPose/mycpp/build
+/home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages/cmake/data/bin/cmake -S/home/user/FoundationPose/mycpp -B/home/user/FoundationPose/mycpp/build --check-build-system CMakeFiles/Makefile.cmake 0
+/home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages/cmake/data/bin/cmake -E cmake_progress_start /home/user/FoundationPose/mycpp/build/CMakeFiles /home/user/FoundationPose/mycpp/build//CMakeFiles/progress.marks
+make  -f CMakeFiles/Makefile2 all
+make[1]: 進入目錄「/home/user/FoundationPose/mycpp/build」
+make  -f CMakeFiles/mycpp.dir/build.make CMakeFiles/mycpp.dir/depend
+make[2]: 進入目錄「/home/user/FoundationPose/mycpp/build」
+cd /home/user/FoundationPose/mycpp/build && /home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages/cmake/data/bin/cmake -E cmake_depends "Unix Makefiles" /home/user/FoundationPose/mycpp /home/user/FoundationPose/mycpp /home/user/FoundationPose/mycpp/build /home/user/FoundationPose/mycpp/build /home/user/FoundationPose/mycpp/build/CMakeFiles/mycpp.dir/DependInfo.cmake "--color="
+make[2]: 離開目錄「/home/user/FoundationPose/mycpp/build」
+make  -f CMakeFiles/mycpp.dir/build.make CMakeFiles/mycpp.dir/build
+make[2]: 進入目錄「/home/user/FoundationPose/mycpp/build」
+[ 33%] Building CXX object CMakeFiles/mycpp.dir/src/app/pybind_api.cpp.o
+[ 66%] Building CXX object CMakeFiles/mycpp.dir/src/Utils.cpp.o
+/usr/bin/c++ -DBOOST_ALL_NO_LIB -DBOOST_PROGRAM_OPTIONS_DYN_LINK -DBOOST_SYSTEM_DYN_LINK -Dmycpp_EXPORTS -I/home/user/FoundationPose/mycpp/include -isystem /home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages/pybind11/include -isystem /home/user/anaconda3/envs/foundationpose/include/python3.8 -isystem /home/user/anaconda3/envs/foundationpose/include/eigen3 -std=c++14 -fopenmp -g3 -O3 -O3 -DNDEBUG -fPIC -fvisibility=hidden -flto -fno-fat-lto-objects -MD -MT CMakeFiles/mycpp.dir/src/app/pybind_api.cpp.o -MF CMakeFiles/mycpp.dir/src/app/pybind_api.cpp.o.d -o CMakeFiles/mycpp.dir/src/app/pybind_api.cpp.o -c /home/user/FoundationPose/mycpp/src/app/pybind_api.cpp
+/usr/bin/c++ -DBOOST_ALL_NO_LIB -DBOOST_PROGRAM_OPTIONS_DYN_LINK -DBOOST_SYSTEM_DYN_LINK -Dmycpp_EXPORTS -I/home/user/FoundationPose/mycpp/include -isystem /home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages/pybind11/include -isystem /home/user/anaconda3/envs/foundationpose/include/python3.8 -isystem /home/user/anaconda3/envs/foundationpose/include/eigen3 -std=c++14 -fopenmp -g3 -O3 -O3 -DNDEBUG -fPIC -fvisibility=hidden -flto -fno-fat-lto-objects -MD -MT CMakeFiles/mycpp.dir/src/Utils.cpp.o -MF CMakeFiles/mycpp.dir/src/Utils.cpp.o.d -o CMakeFiles/mycpp.dir/src/Utils.cpp.o -c /home/user/FoundationPose/mycpp/src/Utils.cpp
+/home/user/FoundationPose/mycpp/src/app/pybind_api.cpp: In function ‘vectorMatrix4f cluster_poses(float, float, const vectorMatrix4f&, const vectorMatrix4f&)’:
+/home/user/FoundationPose/mycpp/src/app/pybind_api.cpp:26:38: warning: format ‘%d’ expects argument of type ‘int’, but argument 2 has type ‘std::vector<Eigen::Matrix<float, 4, 4>, Eigen::aligned_allocator<Eigen::Matrix<float, 4, 4> > >::size_type’ {aka ‘long unsigned int’} [-Wformat=]
+   26 |   printf("num original candidates = %d\n",poses_in.size());
+      |                                     ~^    ~~~~~~~~~~~~~~~
+      |                                      |                 |
+      |                                      int               std::vector<Eigen::Matrix<float, 4, 4>, Eigen::aligned_allocator<Eigen::Matrix<float, 4, 4> > >::size_type {aka long unsigned int}
+      |                                     %ld
+/home/user/FoundationPose/mycpp/src/app/pybind_api.cpp:66:42: warning: format ‘%d’ expects argument of type ‘int’, but argument 2 has type ‘std::vector<Eigen::Matrix<float, 4, 4>, Eigen::aligned_allocator<Eigen::Matrix<float, 4, 4> > >::size_type’ {aka ‘long unsigned int’} [-Wformat=]
+   66 |   printf("num of pose after clustering: %d\n",poses_out.size());
+      |                                         ~^    ~~~~~~~~~~~~~~~~
+      |                                          |                  |
+      |                                          int                std::vector<Eigen::Matrix<float, 4, 4>, Eigen::aligned_allocator<Eigen::Matrix<float, 4, 4> > >::size_type {aka long unsigned int}
+      |                                         %ld
+[100%] Linking CXX shared module mycpp.cpython-38-x86_64-linux-gnu.so
+/home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages/cmake/data/bin/cmake -E cmake_link_script CMakeFiles/mycpp.dir/link.txt --verbose=1
+/usr/bin/c++ -fPIC  -std=c++14 -fopenmp -g3 -O3 -O3 -DNDEBUG -flto -shared  -o mycpp.cpython-38-x86_64-linux-gnu.so CMakeFiles/mycpp.dir/src/app/pybind_api.cpp.o CMakeFiles/mycpp.dir/src/Utils.cpp.o  /usr/lib/x86_64-linux-gnu/libboost_system.so.1.71.0 /usr/lib/x86_64-linux-gnu/libboost_program_options.so.1.71.0 -fopenmp
+/usr/bin/strip /home/user/FoundationPose/mycpp/build/mycpp.cpython-38-x86_64-linux-gnu.so
+make[2]: 離開目錄「/home/user/FoundationPose/mycpp/build」
+[100%] Built target mycpp
+make[1]: 離開目錄「/home/user/FoundationPose/mycpp/build」
+/home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages/cmake/data/bin/cmake -E cmake_progress_start /home/user/FoundationPose/mycpp/build/CMakeFiles 0
+Obtaining file:///home/user/FoundationPose/bundlesdf/mycuda
+  Preparing metadata (setup.py): started
+  Preparing metadata (setup.py): finished with status 'done'
+Installing collected packages: common
+  DEPRECATION: Legacy editable install of common==0.0.0 from file:///home/user/FoundationPose/bundlesdf/mycuda (setup.py develop) is deprecated. pip 25.1 will enforce this behaviour change. A possible replacement is to add a pyproject.toml or enable --use-pep517, and use setuptools >= 64. If the resulting installation is not behaving as expected, try using --config-settings editable_mode=compat. Please consult the setuptools documentation for more information. Discussion can be found at https://github.com/pypa/pip/issues/11457
+  Running setup.py develop for common
+Successfully installed common

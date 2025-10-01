@@ -201,7 +201,7 @@ __device__ Eigen::Vector3f calculateBarycentricCoordinate3DKernel(const Eigen::M
 }
 
 
-__device__ void calculateBarycentricCoordinate2DKernel(const Eigen::Matrix<float,3,2> &triangle, const Eigen::Vector2f &p, Eigen::Vector3f &w)
+/*__device__ void calculateBarycentricCoordinate2DKernel(const Eigen::Matrix<float,3,2> &triangle, const Eigen::Vector2f &p, Eigen::Vector3f &w)
 {
   Eigen::Vector2f CA = triangle.row(0)-triangle.row(2);
   Eigen::Vector2f AC = -CA;
@@ -216,7 +216,50 @@ __device__ void calculateBarycentricCoordinate2DKernel(const Eigen::Matrix<float
   w(2) = numerator.determinant()/denominator.determinant();
   w(0) = 1-w(1)-w(2);
 }
+*/
+// 放在檔案開頭或此函式前面：2x2 行列式小工具
+__device__ __forceinline__ float det2(float a, float b, float c, float d) {
+    return a * d - b * c;
+}
 
+__device__ void calculateBarycentricCoordinate2DKernel(
+    const Eigen::Matrix<float,3,2> &triangle,
+    const Eigen::Vector2f &p,
+    Eigen::Vector3f &w)
+{
+    // 取三個頂點與像素座標（僅是讀記憶體，不用 Eigen 高階運算）
+    float Ax = triangle(0,0), Ay = triangle(0,1);
+    float Bx = triangle(1,0), By = triangle(1,1);
+    float Cx = triangle(2,0), Cy = triangle(2,1);
+    float px = p(0),          py = p(1);
+
+    // 邊向量與相對向量
+    float e0x = Bx - Ax, e0y = By - Ay;   // e0 = B - A
+    float e1x = Cx - Ax, e1y = Cy - Ay;   // e1 = C - A
+    float vx  = px - Ax, vy  = py - Ay;   // v  = P - A
+
+    // 2x2 行列式（分母）
+    float denom = det2(e0x, e1x, e0y, e1y);
+
+    // 避免除以 0（或極小值）
+    if (fabsf(denom) < 1e-12f) {
+        // 視需求給預設值；這裡先設成全重心在 A
+        w(0) = 1.0f; w(1) = 0.0f; w(2) = 0.0f;
+        return;
+    }
+
+    // 重心座標（A=0, B=1, C=2 的慣例）
+    // w1 = det(v, e1) / det(e0, e1)
+    // w2 = det(e0, v) / det(e0, e1)
+    // w0 = 1 - w1 - w2
+    float w1 = det2(vx, e1x, vy, e1y) / denom;
+    float w2 = det2(e0x, vx,  e0y, vy) / denom;
+    float w0 = 1.0f - w1 - w2;
+
+    w(0) = w0;  // 對應頂點 A
+    w(1) = w1;  // 對應頂點 B
+    w(2) = w2;  // 對應頂點 C
+}
 
 
 template<class scalar_t>
