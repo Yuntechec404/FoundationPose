@@ -53,6 +53,7 @@ class FoundationPoseTracker:
         self.iou_bad_count = 0
         self.iou_val = None
         self.K = None
+        self._last_yolo_text = ""
 
         self._rgb_win_created = False
         self._depth_win_created = False
@@ -649,27 +650,29 @@ class FoundationPoseTracker:
         回傳 (更新後影像, iou_val)
         """
         iou_val = None
-        if detector is None or frame_count % max(1, stride) != 0 or center_pose is None:
-            return vis_bgr, iou_val
-
+        # 不是計算幀：沿用上次文字，避免畫面忽隱忽現
+        if detector is None or center_pose is None or (frame_count % max(1, stride) != 0):
+            if self._last_yolo_text:
+                cv2.putText(vis_bgr, self._last_yolo_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 1, cv2.LINE_AA)
+            return vis_bgr, None
+    
         H, W = color.shape[:2]
 
         # 投影 bbox
         est_xyxy = self.project_3d_bbox_xyxy(K, center_pose, bbox_minmax, img_shape=color.shape)
-        if est_xyxy is None:    # 投影失敗就只顯示偵測數
+        if est_xyxy is None:
             xyxy_all, sc_all, cl_all = self.yolo_det_all(detector, color, imgsz=det_imgsz, conf=det_conf)
-            cv2.putText(vis_bgr, f"YOLO det={len(xyxy_all)}", (10, 25),
+            self._last_yolo_text = f"YOLO det={len(xyxy_all)}"
+            cv2.putText(vis_bgr, self._last_yolo_text, (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
-            return vis_bgr, iou_val
-        
+            return vis_bgr, None
         # YOLO 偵測
         xyxy_all, sc_all, cl_all = self.yolo_det_all(detector, color, imgsz=det_imgsz, conf=det_conf)
         if len(xyxy_all) == 0:
-            cv2.putText(vis_bgr, "YOLO det=0", (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
+            self._last_yolo_text = "YOLO det=0"
+            cv2.putText(vis_bgr, self._last_yolo_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
             return vis_bgr, 0.0
-        
-        # 若有指定 prefer_cls，且該類別有偵測，僅在該類別中挑；否則全體比較
+        # 類別篩選
         use_mask = np.ones(len(xyxy_all), dtype=bool)
         if prefer_cls is not None and (cl_all == prefer_cls).any():
             use_mask = (cl_all == prefer_cls)
@@ -678,7 +681,7 @@ class FoundationPoseTracker:
         sc_use = sc_all[use_mask]
         cl_use = cl_all[use_mask]
 
-        # 算每一個偵測與投影框的 IoU，取最大
+        # IoU 計算
         ious = []
         for bb in xyxy_use:
             bb_clipped = self.clip_xyxy(bb, W, H)
@@ -686,7 +689,8 @@ class FoundationPoseTracker:
         ious = np.array(ious, dtype=float)
 
         if len(ious) == 0:
-            cv2.putText(vis_bgr, f"YOLO det={len(xyxy_all)} (no valid)", (10, 25),cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 1, cv2.LINE_AA)
+            self._last_yolo_text = f"YOLO det={len(xyxy_all)} (no valid)"
+            cv2.putText(vis_bgr, self._last_yolo_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 1, cv2.LINE_AA)
             return vis_bgr, None
 
         best_idx = int(np.argmax(ious))
@@ -694,8 +698,9 @@ class FoundationPoseTracker:
         best_cls = int(cl_use[best_idx])
         best_sc  = float(sc_use[best_idx])
 
-        # 左上角顯示最佳配對資訊
-        cv2.putText(vis_bgr, f"YOLO det={len(xyxy_all)} best cls={best_cls} s={best_sc:.2f} IoU={iou_val:.3f}",(10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 1, cv2.LINE_AA)
+        # 更新並顯示本幀資訊 + 緩存
+        self._last_yolo_text = f"YOLO det={len(xyxy_all)} best cls={best_cls} s={best_sc:.2f} IoU={iou_val:.3f}"
+        cv2.putText(vis_bgr, self._last_yolo_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 1, cv2.LINE_AA)
 
         if log:
             rospy.loginfo(f"[IOU] frame={frame_count} best_iou={iou_val:.4f} (cls={best_cls}, score={best_sc:.3f})")
@@ -882,12 +887,14 @@ class FoundationPoseTracker:
                     self.draw_conf_bar(vis_bgr,{"IoU": float(self.iou_val)},label="IoU",origin=(10, vis_bgr.shape[0] - margin - bar_h),size=(bar_w, bar_h),max_val=1.0)
                 if self.init_mode == 'yolo':
                     # === 每 N 幀做一次 YOLO vs. 估測框 IoU===
-                    vis_bgr, self.iou_val = self.periodic_yolo_iou(
+                    vis_bgr, _new_iou  = self.periodic_yolo_iou(
                         frame_count=self.frame_count, stride=self.iou_stride, detector=self.detector,
                         color=self.color, center_pose=center_pose, bbox_minmax=self.bbox, K=self.K,
                         det_imgsz=self.det_imgsz, det_conf=self.det_conf, prefer_cls=self.prefer_cls,
                         vis_bgr=vis_bgr, log=self.iou_log
                     )
+                    if _new_iou is not None:
+                        self.iou_val = float(_new_iou) 
                     # IoU 連續低於閾值則觸發重新流程
                     if self.iou_val is not None:
                         if self.iou_val < self.iou_thresh:
