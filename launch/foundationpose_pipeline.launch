@@ -1,0 +1,171 @@
+<launch>
+  <!-- Topics / Frames -->
+  <arg name="image_topic"             default="/camera/color/image_raw"/>
+  <arg name="info_topic"              default="/camera/color/camera_info"/>
+  <arg name="depth_topic"             default="/camera/aligned_depth_to_color/image_raw"/>
+  <arg name="depth_info_topic"        default=""/>
+  <arg name="camera_tf"               default="camera_color_optical_frame"/>
+  <arg name="bunch_name"              default="oilpalm"/>
+  <arg name="stem_name"               default="stem"/>
+
+  <!-- 檔案 -->
+  <arg name="det_model"               default="$(find ros_foundationpose)/data/oilpalm_stem.onnx"/>
+  <arg name="mesh_file"               default="$(find ros_foundationpose)/data/oilpalm/oilpalm.obj"/>     <!-- 果串 mesh -->
+  <arg name="mesh_file_stem"          default="$(find ros_foundationpose)/data/curved_stem/curved_stem.obj"/>        <!-- 葉莖 mesh -->
+  <arg name="debug_dir"               default="$(find ros_foundationpose)/log"/>
+
+  <!-- 模式 / 演算法 -->
+  <arg name="init_mode"               default="yolo"/>            <!-- yolo | click -->
+  <arg name="yolo_start_mode"         default="immediate"/>       <!-- immediate | wait -->
+
+  <!-- YOLO -->
+  <arg name="det_conf"                default="0.25"/>
+  <arg name="det_class"               default="-1"/>              <!-- 不限 -->
+  <arg name="det_imgsz"               default="640"/>
+  <arg name="det_select_mode"         default="score"/>           <!-- score | top | bottom -->
+
+  <!-- FoundationPose iters -->
+  <arg name="est_refine_iter"         default="5"/>
+  <arg name="track_refine_iter"       default="2"/>
+
+  <!-- IoU / ROI -->
+  <arg name="roi_expand"              default="0.01"/>
+  <arg name="iou_stride"              default="3"/>
+  <arg name="iou_log"                 default="false"/>
+  <arg name="iou_thresh"              default="0.2"/>
+  <arg name="iou_patience"            default="3"/>
+
+  <!-- 視窗 -->
+  <arg name="show_depth_window"       default="false"/>
+  <arg name="show_rgb_window"         default="true"/>
+  <arg name="depth_win_name"          default="Depth"/>
+  <arg name="rgb_win_name"            default="RGB"/>
+  <arg name="depth_window_xy"         default="[100,100]"/>
+  <arg name="rgb_window_xy"           default="[100,500]"/>
+  <arg name="max_depth_mm"            default="2000.0"/>
+  <arg name="colormap"                default="2"/>
+  <arg name="invert_colormap"         default="false"/>
+
+  <!-- 後處理（共用） -->
+  <arg name="pp_enable"               default="true"/>
+  <arg name="pp_orient_center_tol_px" default="20.0"/>
+
+  <!-- 果串（BUNCH） -->
+  <arg name="pp_bunch_expect_orientation" default="inverted"/>
+  <arg name="pp_bunch_size_mode"          default="bbox_mm"/>  <!-- bbox_mm | depth -->
+  <arg name="pp_bunch_expect_bbox_w_mm"   default="115.0"/>
+  <arg name="pp_bunch_expect_bbox_h_mm"   default="80.0"/>
+  <arg name="pp_bunch_size_ratio_min"     default="0.6"/>
+  <arg name="pp_bunch_expect_depth_m"     default="1.2"/>
+  <arg name="pp_bunch_depth_tol_m"        default="0.25"/>
+
+  <!-- 葉莖（STEM） -->
+  <arg name="pp_stem_expect_orientation"  default="inverted"/>
+  <arg name="pp_stem_size_mode"           default="bbox_mm"/>
+  <arg name="pp_stem_expect_bbox_w_mm"    default="115.0"/>
+  <arg name="pp_stem_expect_bbox_h_mm"    default="500.0"/>
+  <arg name="pp_stem_size_ratio_min"      default="0.6"/>
+  <arg name="pp_stem_expect_depth_m"      default="1.2"/>
+  <arg name="pp_stem_depth_tol_m"         default="0.25"/>
+
+  <!-- 分類 id（你的資料集 class id） -->
+  <arg name="cls_bunch"                   default="0"/>
+  <arg name="cls_stem"                    default="1"/>
+
+  <!-- 遮蔽率策略 -->
+  <arg name="policy_occ_thresh_high"      default="0.50"/>  <!-- 高於→切 STEM -->
+  <arg name="policy_occ_thresh_low"       default="0.40"/>  <!-- 低於→回 BUNCH -->
+  <arg name="policy_high_patience"        default="3"/>
+  <arg name="policy_recheck_interval"     default="10"/>
+  <arg name="policy_light_init_iters"     default="1"/>
+  <arg name="allow_bunch_recheck_in_stem" default="False"/>
+
+  <!-- 分割後端（SAM 可選） -->
+  <arg name="seg_backend"                 default="sam"/>   <!-- sam | bbox -->
+  <arg name="sam_model"                   default="vit_h"/>
+  <arg name="sam_ckpt"                    default="$(find ros_foundationpose)/data/sam_vit_h.pth"/>
+  <arg name="occ_sam_warmup_n"            default="8"/>  <!-- 初始化成功後，前 N 幀用 SAM；之後改 IoU -->
+
+  <node pkg="ros_foundationpose" type="pipeline_tracker.py" name="pipeline_tracker" output="screen">
+    <!-- Topics / Frames -->
+    <param name="image_topic"        value="$(arg image_topic)"/>
+    <param name="info_topic"         value="$(arg info_topic)"/>
+    <param name="depth_topic"        value="$(arg depth_topic)"/>
+    <param name="depth_info_topic"   value="$(arg depth_info_topic)"/>
+    <param name="camera_tf"          value="$(arg camera_tf)"/>
+    <param name="bunch_name"        value="$(arg bunch_name)"/>
+    <param name="stem_name"        value="$(arg stem_name)"/>
+
+    <!-- 檔案 -->
+    <param name="det_model"          value="$(arg det_model)"/>
+    <param name="mesh_file"          value="$(arg mesh_file)"/>
+    <param name="mesh_file_stem"     value="$(arg mesh_file_stem)"/>
+    <param name="debug_dir"          value="$(arg debug_dir)"/>
+
+    <!-- 模式 / 演算法 -->
+    <param name="init_mode"          value="$(arg init_mode)"/>
+    <param name="yolo_start_mode"    value="$(arg yolo_start_mode)"/>
+    <param name="det_conf"           value="$(arg det_conf)"/>
+    <param name="det_class"          value="$(arg det_class)"/>
+    <param name="det_imgsz"          value="$(arg det_imgsz)"/>
+    <param name="det_select_mode"    value="$(arg det_select_mode)"/>
+    <param name="est_refine_iter"    value="$(arg est_refine_iter)"/>
+    <param name="track_refine_iter"  value="$(arg track_refine_iter)"/>
+
+    <!-- 追蹤 / IoU -->
+    <param name="roi_expand"         value="$(arg roi_expand)"/>
+    <param name="iou_stride"         value="$(arg iou_stride)"/>
+    <param name="iou_log"            value="$(arg iou_log)"/>
+    <param name="iou_thresh"         value="$(arg iou_thresh)"/>
+    <param name="iou_patience"       value="$(arg iou_patience)"/>
+
+    <!-- 視窗 -->
+    <param name="show_depth_window"  value="$(arg show_depth_window)"/>
+    <param name="show_rgb_window"    value="$(arg show_rgb_window)"/>
+    <param name="depth_win_name"     value="$(arg depth_win_name)"/>
+    <param name="rgb_win_name"       value="$(arg rgb_win_name)"/>
+    <param name="depth_window_xy"    value="$(arg depth_window_xy)" type="yaml"/>
+    <param name="rgb_window_xy"      value="$(arg rgb_window_xy)" type="yaml"/>
+    <param name="max_depth_mm"       value="$(arg max_depth_mm)"/>
+    <param name="colormap"           value="$(arg colormap)"/>
+    <param name="invert_colormap"    value="$(arg invert_colormap)"/>
+
+    <!-- 後處理（共用） -->
+    <param name="postproc/enable"                 value="$(arg pp_enable)"/>
+    <param name="postproc/orient_center_tol_px"   value="$(arg pp_orient_center_tol_px)"/>
+
+    <!-- 果串（BUNCH） -->
+    <param name="postproc/bunch/expect_orientation" value ="$(arg pp_bunch_expect_orientation)"/>
+    <param name="postproc/bunch/size_mode"          value ="$(arg pp_bunch_size_mode)"/>
+    <param name="postproc/bunch/expect_bbox_w_mm"   value ="$(arg pp_bunch_expect_bbox_w_mm)"/>
+    <param name="postproc/bunch/expect_bbox_h_mm"   value ="$(arg pp_bunch_expect_bbox_h_mm)"/>
+    <param name="postproc/bunch/size_ratio_min"     value ="$(arg pp_bunch_size_ratio_min)"/>
+    <param name="postproc/bunch/expect_depth_m"     value ="$(arg pp_bunch_expect_depth_m)"/>
+    <param name="postproc/bunch/depth_tolerance_m"  value ="$(arg pp_bunch_depth_tol_m)"/>
+
+    <!-- 葉莖（STEM） -->
+    <param name="postproc/stem/expect_orientation"  value ="$(arg pp_stem_expect_orientation)"/>
+    <param name="postproc/stem/size_mode"           value ="$(arg pp_stem_size_mode)"/>
+    <param name="postproc/stem/expect_bbox_w_mm"    value ="$(arg pp_stem_expect_bbox_w_mm)"/>
+    <param name="postproc/stem/expect_bbox_h_mm"    value ="$(arg pp_stem_expect_bbox_h_mm)"/>
+    <param name="postproc/stem/size_ratio_min"      value ="$(arg pp_stem_size_ratio_min)"/>
+    <param name="postproc/stem/expect_depth_m"      value ="$(arg pp_stem_expect_depth_m)"/>
+    <param name="postproc/stem/depth_tolerance_m"   value ="$(arg pp_stem_depth_tol_m)"/>
+
+    <!-- 類別 id / 策略 -->
+    <param name="classes/bunch"                     value ="$(arg cls_bunch)"/>
+    <param name="classes/stem"                      value ="$(arg cls_stem)"/>
+    <param name="policy/occ_thresh_high"            value ="$(arg policy_occ_thresh_high)"/>
+    <param name="policy/occ_thresh_low"             value ="$(arg policy_occ_thresh_low)"/>
+    <param name="policy/high_patience"              value ="$(arg policy_high_patience)"/>
+    <param name="policy/recheck_interval"           value ="$(arg policy_recheck_interval)"/>
+    <param name="policy/light_init_iters"           value ="$(arg policy_light_init_iters)"/>
+    <param name="policy/allow_bunch_recheck_in_stem" value ="$(arg allow_bunch_recheck_in_stem)"/>
+
+    <!-- 分割 -->
+    <param name="postproc/seg_backend"              value ="$(arg seg_backend)"/>
+    <param name="postproc/sam_model"                value ="$(arg sam_model)"/>
+    <param name="postproc/sam_ckpt"                 value ="$(arg sam_ckpt)"/>
+    <param name="occ/sam_warmup_n"                  value="$(arg occ_sam_warmup_n)"/>
+  </node>
+</launch>

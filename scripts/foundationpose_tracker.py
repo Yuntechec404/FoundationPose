@@ -62,6 +62,9 @@ class FoundationPoseTracker:
         self._rgb_initial_size = (900, 720)
         self._depth_initial_size = (900, 720)
 
+        self._post_pending = False  # 是否處於延遲再確認中
+        self._post_fail_time = None # 第一次失敗時間戳
+
         # Pub/Sub
         self.image_sub = rospy.Subscriber(self.image_topic, Image, self.imageCallback, queue_size=1)
         self.depth_sub = rospy.Subscriber(self.depth_topic, Image, self.depthCallback, queue_size=1)
@@ -140,7 +143,21 @@ class FoundationPoseTracker:
         self.max_depth_mm = float(gp("max_depth_mm", 10000.0))  # 0~10000mm 會映射到 0~255
         self.colormap_id = int(gp("colormap", int(cv2.COLORMAP_JET)))  # OpenCV colormap 常數
         self.invert_colormap = bool(gp("invert_colormap", False))
-    
+
+        self.pp_enable = bool(gp("postproc/enable", True))
+        self.pp_up_axis = gp("postproc/up_axis", "y").strip().lower() # 模型哪個軸代表「上」：'x'|'y'|'z'
+        self.pp_expect_orientation = gp("postproc/expect_orientation", "upright").strip().lower() # 預期方向：'upright' 或 'inverted'
+        self.pp_orient_center_tol_px = float(gp("postproc/orient_center_tol_px", 20.0)) # 容許中心偏移(px)
+        self.pp_size_mode = gp("postproc/size_mode", "bbox_mm").strip().lower() # 'bbox_mm' 或 'depth'
+        self.pp_expect_bbox_w_mm = float(gp("postproc/expect_bbox_w_mm", 220.0)) # 預期寬度(mm)
+        self.pp_expect_bbox_h_mm = float(gp("postproc/expect_bbox_h_mm", 300.0)) # 預期高度(mm)
+        self.pp_size_ratio_min = float(gp("postproc/size_ratio_min", 0.8))  # 尺寸比例下限
+        # 或者用相機座標 Z 距離（公尺）檢查
+        self.pp_expect_depth_m = float(gp("postproc/expect_depth_m", 1.2))
+        self.pp_depth_tol_m = float(gp("postproc/depth_tolerance_m", 0.25))
+        self.pp_retry_delay_sec = float(gp("postproc/retry_delay_sec", 1.0))  # 延遲秒數
+        # 不符預期時的動作：'reinit'（重新偵測）或 'keep'（忽略）
+        self.pp_on_fail = gp("postproc/on_fail", "reinit").strip().lower()
     # =========================
     # YOLO 後端/裝置資訊工具
     # =========================
@@ -321,7 +338,6 @@ class FoundationPoseTracker:
         # 如果拿不到 session，就照預設（Ultralytics 內部會自己決定）
         rospy.logwarn("[YOLO Loader] ONNX session not exposed; provider control skipped.")
         return det, det_device
-
     # =========================
     # 偵測 / BBox / 幾何工具
     # =========================
@@ -436,7 +452,6 @@ class FoundationPoseTracker:
         u = K[0, 0] * X + K[0, 2]
         v = K[1, 1] * Y + K[1, 2]
         return self.clip_xyxy(np.array([u.min(), v.min(), u.max(), v.max()], dtype=np.float32), W, H)
-
     # =========================
     # 滑鼠點選ROI
     # =========================
@@ -598,7 +613,6 @@ class FoundationPoseTracker:
         mask = np.zeros_like(depth, dtype=bool)
         mask[y_min:y_max, x_min:x_max] = True
         return mask
-
     # =========================
     # 視覺化 / 文字疊圖
     # =========================
@@ -617,7 +631,6 @@ class FoundationPoseTracker:
         cv2.rectangle(img, (x, y), (x + w, y + h), (220, 220, 220), thickness=1)
         # 文字
         cv2.putText(img, f"{label}: {val:.3f}", (x, y - 6),cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-
     # =========================
     # 初始化 / 追蹤輔助（YOLO + IoU）
     # =========================
@@ -706,7 +719,132 @@ class FoundationPoseTracker:
             rospy.loginfo(f"[IOU] frame={frame_count} best_iou={iou_val:.4f} (cls={best_cls}, score={best_sc:.3f})")
 
         return vis_bgr, iou_val
+    # =========================
+    # 姿態檢查工具
+    # =========================
+    def _model_up_vector_local(self):
+        """回傳模型『上』軸（在模型座標系）"""
+        ax = self.pp_up_axis
+        if ax == 'x': return np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        if ax == 'z': return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        return np.array([0.0, 1.0, 0.0], dtype=np.float64)  # default 'y'
+    
+    def _orientation_ok(self, center_pose_cam: np.ndarray, origin_pose_cam: np.ndarray):
+        """
+        以『模型原點 vs 幾何中心』在影像中的上下關係判斷方向：
+        - 若 v_origin < v_center - tol → measured='upright'（原點更高）
+        - 若 v_origin > v_center + tol → measured='inverted'（原點更低）
+        - 否則 measured='neutral'（容許帶內）
+        與 pp_expect_orientation（upright/inverted）比對；在容許帶內視為通過。
+        回傳 (ok: bool, dv_px: float)，其中 dv_px = v_origin - v_center（>0 表示原點更低）
+        """
+        if center_pose_cam is None or origin_pose_cam is None or self.K is None:
+            return True, 0.0
 
+        # 取兩個點（相機座標系）
+        Xc, Yc, Zc = map(float, center_pose_cam[:3, 3])   # 幾何中心
+        Xo, Yo, Zo = map(float, origin_pose_cam[:3, 3])   # 模型原點
+        if Zc <= 1e-6 or Zo <= 1e-6:
+            return True, 0.0
+
+        fx, fy, cx, cy = float(self.K[0,0]), float(self.K[1,1]), float(self.K[0,2]), float(self.K[1,2])
+
+        # 投影成像素座標（只需要 v）
+        vc = fy * (Yc / Zc) + cy
+        vo = fy * (Yo / Zo) + cy
+
+        dv = float(vo - vc)  # >0: 原點在幾何中心『下方』；<0: 原點在上方
+        tol = float(self.pp_orient_center_tol_px)
+
+        if dv < -tol:
+            measured = "upright"    # 原點更高
+        elif dv > tol:
+            measured = "inverted"   # 原點更低
+        else:
+            measured = "neutral"    # 容許帶內
+
+        expect = (self.pp_expect_orientation or "upright").strip().lower()
+        if measured == "neutral":
+            ok = True
+        else:
+            ok = (measured == expect)
+
+        return ok, dv
+
+    def _size_ok(self, K: np.ndarray, color_bgr: np.ndarray, center_pose_cam: np.ndarray):
+        """
+        依設定檢查大小。
+        - size_mode='bbox_mm' ：以實際模型外框尺寸（mm）比較
+        - size_mode='depth'   ：以Z距離比較
+        回傳 (ok:bool, metric:float, metric_name:str)
+        """
+        if center_pose_cam is None:
+            return True, 0.0, "none"
+
+        # --- 模式1：使用物體實際大小（mm）
+        if self.pp_size_mode == "bbox_mm":
+            # 模型在世界的外框尺寸（mm）
+            expected_w = float(self.pp_expect_bbox_w_mm)
+            expected_h = float(self.pp_expect_bbox_h_mm)
+            # 計算模型經當前姿態轉換後的空間長寬（mm）
+            bbox_min, bbox_max = self.bbox
+            corners = np.array([[x, y, z, 1.0] for x in [bbox_min[0], bbox_max[0]]
+                                for y in [bbox_min[1], bbox_max[1]]
+                                for z in [bbox_min[2], bbox_max[2]]], dtype=np.float64)
+            world_pts = (center_pose_cam @ corners.T).T[:, :3] * 1000.0  # m→mm
+            diff = world_pts.max(axis=0) - world_pts.min(axis=0)
+            actual_w = float(np.linalg.norm(diff[[0, 2]]))  # x-z 平面長度當作寬
+            actual_h = float(abs(diff[1]))                 # y方向當作高
+
+            ok_w = (actual_w >= self.pp_size_ratio_min * expected_w)
+            ok_h = (actual_h >= self.pp_size_ratio_min * expected_h)
+            ok = ok_w and ok_h
+            metric = (float(actual_w), float(actual_h))
+            return ok, metric, "bbox_mm>=min(w,h)"
+
+        # --- 模式2：深度距離
+        if self.pp_size_mode == "depth":
+            z = float(center_pose_cam[2, 3])
+            ok = (abs(z - self.pp_expect_depth_m) <= self.pp_depth_tol_m)
+            return ok, z, "depth_m"
+
+        # --- 其他模式關閉
+        return True, 0.0, "none"
+    
+    def postprocess_and_maybe_reinit(self, color_bgr, K, pose_obj_in_cam: np.ndarray):
+        """
+        檢查方向與大小。
+        回傳 (ok_to_publish: bool, pending: bool)
+        - ok_to_publish=True  且 pending=False → 正常發布
+        - ok_to_publish=False 且 pending=True  → 進入延遲再確認，不發布
+        - 其他情況            → 由 spin() 決定（例如 pending 中持續等待）
+        """
+        if not self.pp_enable:
+            return True, False
+
+        center_pose = pose_obj_in_cam @ np.linalg.inv(self.to_origin)  # 幾何中心
+
+        orient_ok, dv_px = self._orientation_ok(center_pose, pose_obj_in_cam)
+        size_ok, metric_val, metric_name = self._size_ok(K, color_bgr, center_pose)
+
+        # log（metric 可能是 tuple 或 float）
+        if isinstance(metric_val, (tuple, list, np.ndarray)) and len(metric_val) >= 2:
+            metric_str = f"({float(metric_val[0]):.1f},{float(metric_val[1]):.1f})"
+        else:
+            metric_str = f"{float(metric_val):.3f}"
+        rospy.loginfo_throttle(1.0, f"[POST] orient_ok={orient_ok} dv_px={dv_px:.1f} | size_ok={size_ok} {metric_name}={metric_str}")
+        # 通過 → 清除 pending
+        if orient_ok and size_ok:
+            self._post_pending = False
+            self._post_fail_time = None
+            return True, False
+
+        # 不通過 → 若尚未 pending，開始計時；若已 pending，由 spin() 負責等時間/觸發 reinit
+        if not self._post_pending:
+            self._post_pending = True
+            self._post_fail_time = rospy.Time.now()
+            rospy.logwarn_throttle(1.0, f"[POST] Fail detected. Debounce for {self.pp_retry_delay_sec:.1f}s before reinit.")
+        return False, True
     # =========================
     # ROS 轉換工具
     # =========================
@@ -834,6 +972,30 @@ class FoundationPoseTracker:
                 self.confidence_publish(0.0, False)
                 continue
 
+            # 延遲再確認狀態：不做位姿估測，倒數到期才reinit
+            if getattr(self, "_post_pending", False):
+                now = rospy.Time.now()
+                start_t = self._post_fail_time or now
+                elapsed = (now - start_t).to_sec()
+                remaining = max(0.0, float(self.pp_retry_delay_sec) - elapsed)
+
+                vis_rgb = self.color.copy() if self.color is not None else np.zeros((480,640,3), np.uint8)
+                cv2.putText(vis_rgb, f"Post-check pending... reinit in {remaining:.1f}s",
+                            (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+                self.pump_windows(vis_rgb if self.show_rgb_win else None,
+                                  self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
+                self.confidence_publish(0.0, False)
+
+                if elapsed >= float(self.pp_retry_delay_sec):
+                    # 時間到 → 觸發 reinit 並清計時
+                    rospy.logwarn("[POST] Debounce timeout reached. Reinit now.")
+                    self._post_pending = False
+                    self._post_fail_time = None
+                    self.pose = None
+                    first_frame = True
+                    # 直接進下一輪，不做任何估測
+                rospy.sleep(0.01)
+                continue
             self.frame_count += 1
             # === 初始化 ROI 階段 ===
             if self.init_mode == 'click':
@@ -865,6 +1027,29 @@ class FoundationPoseTracker:
 
             vis_bgr = self.color.copy()
             if self.pose is not None:
+                # 後處理檢查（此版本回傳 ok_to_publish, pending）
+                ok_to_publish, pending = self.postprocess_and_maybe_reinit(self.color, self.K, self.pose)
+
+                # 若進入 pending：本幀不發布，下一輪最前面會顯示倒數並阻擋估測
+                if pending:
+                    cv2.putText(vis_bgr, "Post-check pending...", (10, 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+                    self.pump_windows(vis_bgr if self.show_rgb_win else None,
+                                      self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
+                    self.confidence_publish(0.0, False)
+                    continue
+
+                # 保險：若不允許發布（理論上不會到這），也跳過
+                if not ok_to_publish:
+                    cv2.putText(vis_bgr, "Re-init (postproc)", (10, 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+                    first_frame = True
+                    self.pump_windows(vis_bgr if self.show_rgb_win else None,
+                                      self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
+                    self.confidence_publish(0.0, False)
+                    continue
+
+                # 後處理通過 → 正常發布/可視化
                 center_pose = self.pose @ np.linalg.inv(self.to_origin)
                 color_rgb = cv2.cvtColor(self.color, cv2.COLOR_BGR2RGB)
                 # rospy.loginfo(f"pose={self.pose})")
