@@ -11,17 +11,17 @@ find_package(catkin REQUIRED COMPONENTS
   cv_bridge
   tf
   message_generation
-  forklift_server
+  forklift_msg
 )
 
 ##############
 ## Messages ##
 ##############
 
-add_message_files(
-  FILES
-  Confidence.msg
-)
+# add_message_files(
+#   FILES
+#   Confidence.msg
+# )
 
 generate_messages(
   DEPENDENCIES

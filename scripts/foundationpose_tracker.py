@@ -12,8 +12,7 @@ import torch
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import Pose, PoseStamped, Transform
 from cv_bridge import CvBridge
-from ros_foundationpose.msg import Confidence
-from forklift_server.msg import Detection
+from forklift_msg.msg import Confidence, Detection
 
 from collections import deque
 import tf
