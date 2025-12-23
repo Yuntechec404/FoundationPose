@@ -16,7 +16,7 @@
 
   <!-- 模式 / 演算法 -->
   <arg name="init_mode"               default="yolo"/>            <!-- yolo | click -->
-  <arg name="yolo_start_mode"         default="immediate"/>       <!-- immediate | wait -->
+  <arg name="yolo_start_mode"         default="wait"/>       <!-- immediate | wait -->
 
   <!-- YOLO -->
   <arg name="det_conf"                default="0.25"/>
@@ -73,7 +73,7 @@
   <arg name="cls_stem"                    default="1"/>
 
   <!-- 遮蔽率策略 -->
-  <arg name="policy_occ_thresh_high"      default="0.50"/>  <!-- 高於→切 STEM -->
+  <arg name="policy_occ_thresh_high"      default="0.40"/>  <!-- 高於→切 STEM -->
   <arg name="policy_occ_thresh_low"       default="0.40"/>  <!-- 低於→回 BUNCH -->
   <arg name="policy_high_patience"        default="3"/>
   <arg name="policy_recheck_interval"     default="10"/>
@@ -85,6 +85,10 @@
   <arg name="sam_model"                   default="vit_h"/>
   <arg name="sam_ckpt"                    default="$(find ros_foundationpose)/data/sam_vit_h.pth"/>
   <arg name="occ_sam_warmup_n"            default="8"/>  <!-- 初始化成功後，前 N 幀用 SAM；之後改 IoU -->
+
+  <arg name="fastsam_imgsz"               default="640"/>
+  <arg name="fastsam_conf"                default="0.4"/>
+  <arg name="fastsam_iou"                 default="0.9"/>
 
   <node pkg="ros_foundationpose" type="pipeline_tracker.py" name="pipeline_tracker" output="screen">
     <!-- Topics / Frames -->
@@ -166,6 +170,9 @@
     <param name="postproc/seg_backend"              value ="$(arg seg_backend)"/>
     <param name="postproc/sam_model"                value ="$(arg sam_model)"/>
     <param name="postproc/sam_ckpt"                 value ="$(arg sam_ckpt)"/>
+    <param name="postproc/fastsam_imgsz"            value ="$(arg fastsam_imgsz)"/>
+    <param name="postproc/fastsam_conf"             value ="$(arg fastsam_conf)"/>
+    <param name="postproc/fastsam_iou"              value ="$(arg fastsam_iou)"/>
     <param name="occ/sam_warmup_n"                  value="$(arg occ_sam_warmup_n)"/>
   </node>
 </launch>

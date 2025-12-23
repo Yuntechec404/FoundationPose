@@ -17,10 +17,17 @@ from forklift_msg.msg import Confidence, Detection
 import tf
 
 # --- 專案路徑 ---
-sys.path.append('/home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages')
-FOUNDATIONPOSE_SRC = "/home/user/FoundationPose"
-if FOUNDATIONPOSE_SRC not in sys.path:
-    sys.path.append(FOUNDATIONPOSE_SRC)
+import sys
+EXTRA_PATHS = [
+    "/home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages",
+    "/home/user/FoundationPose",
+    "/home/user/FastSAM",
+]
+
+for p in EXTRA_PATHS:
+    if p not in sys.path:
+        sys.path.append(p)
+
 
 os.environ.setdefault("ULTRALYTICS_NO_INSTALL", "1")
 
@@ -33,6 +40,15 @@ try:
     _SAM_AVAILABLE = True
 except Exception:
     _SAM_AVAILABLE = False
+
+# FastSAM
+# try:
+#     from fastsam import FastSAM, FastSAMPrompt
+#     _FASTSAM_AVAILABLE = True
+#     rospy.loginfo("[FastSAM] import OK")
+# except Exception as e:
+#     _FASTSAM_AVAILABLE = False
+#     rospy.logerr(f"[FastSAM] import failed: {repr(e)}")
 
 selecting_bbox = False
 box_points = []
@@ -66,9 +82,10 @@ class FoundationPosePipelineTracker:
         self.last_iou_update_stem  = -1
         self.K = None
         self._last_yolo_text = ""
-        self.ready_received = Detection()
-        self.ready_received.detection_allowed = False
-        self.ready_received.layer = 0.0
+        self.bunch_ready_received = Detection()
+        self.bunch_ready_received.detection_allowed = False
+        self.stem_ready_received = Detection()
+        self.stem_ready_received.detection_allowed = False
 
         # SAM 暖機幀數計數器
         self.sam_warmup_left_bunch = 0
@@ -99,7 +116,8 @@ class FoundationPosePipelineTracker:
         self.conf_pub_stem  = rospy.Publisher(self.stem_name  + "_confidence", Confidence, queue_size=1, latch=True)
         # Optional: detection gating topic → 掛在 bunch 名稱上
         if self.yolo_start_mode == "wait":
-            self._ready_sub = rospy.Subscriber(self.bunch_name + "_detection", Detection, self.detectionCallback, queue_size=1)
+            self._ready_sub_bunch = rospy.Subscriber(self.bunch_name + "_detection", Detection, self.bunchdetectionCallback, queue_size=1)
+            self._ready_sub_stem = rospy.Subscriber(self.stem_name + "_detection", Detection, self.stemdetectionCallback, queue_size=1)
 
         self.window_create()
 
@@ -133,6 +151,13 @@ class FoundationPosePipelineTracker:
 
         # YOLOv11
         self.detector, self.det_device = self.load_detector(self.det_model)
+        # --- YOLO warmup (force ORT session creation) ---
+        try:
+            dummy = np.zeros((self.det_imgsz, self.det_imgsz, 3), np.uint8)
+            _ = self.detector.predict(source=dummy, imgsz=self.det_imgsz, conf=0.01, device=self.det_device, verbose=False)
+        except Exception as e:
+            rospy.logwarn(f"[YOLO warmup] failed: {e}")
+
         is_gpu, yolo_desc = self.yolo_uses_gpu(self.detector)
         rospy.loginfo(f"[YOLO] GPU enabled: {is_gpu}  ({yolo_desc})")
         rospy.loginfo(f"[YOLO] predict device hint: {self.det_device}")
@@ -153,10 +178,29 @@ class FoundationPosePipelineTracker:
             if self.seg_backend == "sam":
                 rospy.logwarn("segment_anything not available. Fallback to bbox mask.")
 
+        # FastSAM predictor
+        # self.fastsam_model = None
+        # self._fastsam_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # if self.seg_backend == "fastsam":
+        #     if not _FASTSAM_AVAILABLE:
+        #         rospy.logwarn("FastSAM not available. Fallback to bbox mask.")
+        #     else:
+        #         try:
+        #             if not os.path.isfile(self.fastsam_ckpt):
+        #                 raise FileNotFoundError(f"FastSAM checkpoint not found: {self.fastsam_ckpt}")
+        #             self.fastsam_model = FastSAM(self.fastsam_ckpt)
+        #             rospy.loginfo(f"FastSAM loaded: {self.fastsam_ckpt} on {self._fastsam_device}")
+        #         except Exception as e:
+        #             rospy.logwarn("FastSAM init failed: %r. Fallback to bbox mask.", e)
+        #             self.fastsam_model = None
+
         # 狀態機
         self.mode = "BUNCH"     # BUNCH / STEM
         self._hi_cnt = 0
-        self._lo_cnt = 0
+        self._registering_until = 0
+        self._reinit_until = 0
+        # self._lo_cnt = 0
 
     # ---------------------------
     # 參數
@@ -186,11 +230,8 @@ class FoundationPosePipelineTracker:
         self.det_conf   = float(gp("det_conf", 0.25))
         self.det_class  = int(gp("det_class", -1))
         self.det_imgsz  = int(gp("det_imgsz", 640))
-        self.det_select_mode = gp("det_select_mode", "score").strip().lower()
-        if self.det_select_mode not in ("score","top","bottom"):
-            rospy.logwarn("Unknown det_select_mode=%s, fallback to 'score'", self.det_select_mode)
-            self.det_select_mode = "score"
         self.prefer_cls = None if self.det_class < 0 else self.det_class
+        self.det_select_mode = gp("det_select_mode", "score").strip().lower()
 
         # FoundationPose iters
         self.est_refine_iter   = int(gp("est_refine_iter", 5))
@@ -260,16 +301,19 @@ class FoundationPosePipelineTracker:
 
         # 遮蔽率策略
         self.policy_occ_hi   = float(gp("policy/occ_thresh_high", 0.60))
-        self.policy_occ_lo   = float(gp("policy/occ_thresh_low",  0.40))
         self.policy_hi_pat   = int(gp("policy/high_patience", 3))
-        self.policy_recheckN = int(gp("policy/recheck_interval", 10))
-        self.policy_light_it = int(gp("policy/light_init_iters", 1))
         self.policy_allow_bunch_recheck = bool(gp("policy/allow_bunch_recheck_in_stem", False))
 
         # 分割後端
         self.seg_backend = gp("postproc/seg_backend", "sam").strip().lower()  # sam | bbox
         self.sam_model   = gp("postproc/sam_model", "vit_h").strip()
         self.sam_ckpt    = gp("postproc/sam_ckpt", gp("postproc/sam_ckpt_path", "/home/user/.cache/sam_vit_h.pth")).strip()
+
+        # FastSAM params
+        self.fastsam_ckpt  = gp("postproc/fastsam_ckpt", "/home/user/FastSAM/weights/FastSAM-x.pt").strip()
+        self.fastsam_imgsz = int(gp("postproc/fastsam_imgsz", 640))
+        self.fastsam_conf  = float(gp("postproc/fastsam_conf", 0.4))
+        self.fastsam_iou   = float(gp("postproc/fastsam_iou", 0.9))
         self.occ_sam_warmup_n = int(gp("occ/sam_warmup_n", 8))
 
         # reinit debounce 秒數
@@ -468,6 +512,59 @@ class FoundationPosePipelineTracker:
         v = K[1,1]*Y + K[1,2]
         return self.clip_xyxy(np.array([u.min(), v.min(), u.max(), v.max()], dtype=np.float32), W, H)
 
+    def select_yolo_bbox(self, xyxy, scores, classes, img_shape,
+                        prefer_cls=None, select_mode="score"):
+        """
+        從 YOLO 偵測結果中選 1 個 bbox
+        select_mode:
+            - "score"  : confidence 最大
+            - "middle" : bbox 中心最靠近影像中心
+        """
+        if xyxy is None or len(xyxy) == 0:
+            return None, None
+
+        H, W = img_shape[:2]
+
+        # 類別過濾
+        idx = np.arange(len(xyxy))
+        if prefer_cls is not None:
+            idx = idx[classes == prefer_cls]
+        if idx.size == 0:
+            return None, None
+
+        xyxy = xyxy[idx]
+        scores = scores[idx]
+
+        if select_mode == "score":
+            j = int(np.argmax(scores))
+            return xyxy[j], float(scores[j])
+
+        elif select_mode == "middle":
+            cx_img = W * 0.5
+            cy_img = H * 0.5
+
+            best_d = 1e18
+            best_j = -1
+            for i, bb in enumerate(xyxy):
+                cx = 0.5 * (bb[0] + bb[2])
+                cy = 0.5 * (bb[1] + bb[3])
+                d = (cx - cx_img) ** 2 + (cy - cy_img) ** 2
+                if d < best_d:
+                    best_d = d
+                    best_j = i
+
+            if best_j >= 0:
+                return xyxy[best_j], float(scores[best_j])
+
+            return None, None
+
+        else:
+            rospy.logwarn_throttle(
+                1.0, f"[YOLO] Unknown det_select_mode={select_mode}, fallback to score"
+            )
+            j = int(np.argmax(scores))
+            return xyxy[j], float(scores[j])
+
     # =========================
     # IoU / 遮蔽率（暖機後）
     # =========================
@@ -585,6 +682,7 @@ class FoundationPosePipelineTracker:
                 self.pump_windows(vis if self.show_rgb_win else None,
                                   self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
                 # 本幀已處理 re-init → 呼叫端應跳過後續
+                self._set_reinit(3)
                 return True
 
             # 沒框 → 清空該 mode 的 pose，交由下輪初始化
@@ -598,6 +696,7 @@ class FoundationPosePipelineTracker:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
             self.pump_windows(vis if self.show_rgb_win else None,
                               self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
+            self._set_reinit(3)
             return True
 
         return False
@@ -844,7 +943,6 @@ class FoundationPosePipelineTracker:
             self.color, self.K, center_pose, bbox,
             prefer_cls=prefer_cls, det_imgsz=self.det_imgsz, det_conf=self.det_conf
         )
-        # iou_val 可能為 None（例如投影失效），畫面 bar 時我們會處理預設值
 
         # 暖機：用 SAM + GT 算 occ
         if self._get_warmup_left(which_l) > 0:
@@ -1301,27 +1399,78 @@ class FoundationPosePipelineTracker:
         self.got_depth = True
         self.depth_size = (self.depth_vis.shape[1], self.depth_vis.shape[0])
 
-    def detectionCallback(self, msg: Detection):
-        self.ready_received.detection_allowed = msg.detection_allowed
-        self.ready_received.layer = msg.layer
-        if msg.layer == 0.0: self.det_select_mode = "score"
-        elif msg.layer == 1.0: self.det_select_mode = "bottom"
-        elif msg.layer == 2.0: self.det_select_mode = "top"
-        else: self.det_select_mode = "score"
+    def bunchdetectionCallback(self, msg: Detection):
+        mode = (msg.det_select_mode or "").strip().lower()
+        if mode not in ("score","middle"):
+            rospy.logwarn_throttle(1.0, f"[BUNCH] invalid det_select_mode={mode}, fallback score")
+            mode = "score"
+        self.bunch_det_select_mode = mode
+        self.bunch_ready_received.detection_allowed = msg.detection_allowed
 
-    def confidence_publish(self, which: str, score: float, detection: bool):
-        """which: 'bunch' or 'stem'"""
+    def stemdetectionCallback(self, msg: Detection):
+        mode = (msg.det_select_mode or "").strip().lower()
+        if mode not in ("score","middle"):
+            rospy.logwarn_throttle(1.0, f"[STEM] invalid det_select_mode={mode}, fallback score")
+            mode = "score"
+        self.stem_ready_received.detection_allowed = msg.detection_allowed
+        self.stem_det_select_mode = mode
+
+    def _tag(self, which: str) -> str:
+        return "BUNCH" if which.lower() == "bunch" else "STEM"
+
+    def _set_registering(self, n_frames: int = 2):
+        self._registering_until = self.frame_count + max(1, int(n_frames))
+
+    def _set_reinit(self, n_frames: int = 3):
+        self._reinit_until = self.frame_count + max(1, int(n_frames))
+
+    def _state(self, which: str, used_sam: bool = False) -> str:
+        part = self._tag(which)
+
+        allowed = (self.bunch_ready_received.detection_allowed if which.lower()=="bunch"
+                else self.stem_ready_received.detection_allowed)
+
+        if self.yolo_start_mode == "wait" and (not allowed):
+            return f"{part}:DETECTION_DISABLED"
+
+        if not (self.got_depth and self.got_rgb and self.K is not None and hasattr(self, "depth_m")):
+            return f"{part}:INITIALIZING"
+
+        if getattr(self, "_post_pending", False):
+            return f"{part}:POSTPROCESS"
+
+        if getattr(self, "_reinit_until", 0) >= self.frame_count:
+            return f"{part}:REINITIALIZING"
+
+        if getattr(self, "_registering_until", 0) >= self.frame_count:
+            return f"{part}:REGISTERING"
+
+        if which.lower() == "bunch":
+            if self.pose_bunch is None:
+                return f"{part}:YOLO"
+            if used_sam and self.sam_warmup_left_bunch > 0:
+                return f"{part}:SAM"
+            return f"{part}:STABLE"
+        else:
+            if self.pose_stem is None:
+                return f"{part}:YOLO"
+            if used_sam and self.sam_warmup_left_stem > 0:
+                return f"{part}:SAM"
+            return f"{part}:STABLE"
+
+    def confidence_publish(self, which: str, score: float, detection: bool, used_sam: bool = False):
         conf_msg = Confidence()
         conf_msg.stamp = rospy.Time.now()
+        conf_msg.state = self._state(which, used_sam=used_sam)
         if which.lower() == "bunch":
             conf_msg.frame_id = self.bunch_name
             conf_msg.object_IoU = float(score)
-            conf_msg.object_detection = detection
+            conf_msg.object_detection = bool(detection)
             self.conf_pub_bunch.publish(conf_msg)
         else:
             conf_msg.frame_id = self.stem_name
             conf_msg.object_IoU = float(score)
-            conf_msg.object_detection = detection
+            conf_msg.object_detection = bool(detection)
             self.conf_pub_stem.publish(conf_msg)
 
     # =========================
@@ -1329,22 +1478,29 @@ class FoundationPosePipelineTracker:
     # =========================
     def spin(self):
         self.frame_count = 0
-
+        used_sam = False
         while not rospy.is_shutdown():
             if not (self.got_depth and self.got_rgb and self.K is not None and hasattr(self, "depth_m")):
                 self.pump_windows(self.color if self.got_rgb else None,
                                   self.depth_vis if self.got_depth else None)
                 rospy.sleep(0.01); continue
-            # 若收到採收完成訊號，重設為果串模式
-            if not self.ready_received.detection_allowed:
+            # 若收到「果串採收完成」訊號，整個 pipeline 回到初始狀態，等下一顆果串
+            if self.yolo_start_mode == 'wait' and not self.bunch_ready_received.detection_allowed:
                 self.mode = "BUNCH"
-                self.pose_stem = None
-                self._hi_cnt = self._lo_cnt = 0
-                self.confidence_publish("bunch", 0.0, False)
-                self.confidence_publish("stem",  0.0, False)
+                self.pose_bunch = None
+                self.pose_stem  = None
+
+                self._hi_cnt = 0
+                # self._lo_cnt = 0
+                self.iou_bad_count_bunch = 0
+                self.iou_bad_count_stem  = 0
+                self.sam_warmup_left_bunch = 0
+                self.sam_warmup_left_stem  = 0
+                self.confidence_publish("bunch", 0.0, False, used_sam)
+                self.confidence_publish("stem", 0.0, False, used_sam)
 
             if (self.init_mode == 'yolo' and self.yolo_start_mode == 'wait'
-                and not self.ready_received.detection_allowed):
+                and not self.bunch_ready_received.detection_allowed):
                 self.pose_bunch = None; self.pose_stem = None
                 self.iou_bad_count = 0; self.iou_val = None
                 vis_rgb = self.color.copy()
@@ -1352,8 +1508,8 @@ class FoundationPosePipelineTracker:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
                 self.pump_windows(vis_rgb if self.show_rgb_win else None,
                                   self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
-                self.confidence_publish("bunch", 0.0, False)
-                self.confidence_publish("stem",  0.0, False)
+                self.confidence_publish("bunch", 0.0, False, used_sam)
+                self.confidence_publish("stem", 0.0, False, used_sam)
                 continue
 
             # 後處理 debounce：倒數中，暫停估測
@@ -1367,10 +1523,11 @@ class FoundationPosePipelineTracker:
                             (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2, cv2.LINE_AA)
                 self.pump_windows(vis_rgb if self.show_rgb_win else None,
                                   self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
-                self.confidence_publish("bunch", 0.0, False)
-                self.confidence_publish("stem",  0.0, False)
+                self.confidence_publish("bunch", 0.0, False, used_sam)
+                self.confidence_publish("stem", 0.0, False, used_sam)
                 if elapsed >= float(self.pp_retry_delay_sec):
                     rospy.logwarn("[POST] Debounce timeout reached. Reinit now.")
+                    self._set_reinit(3)
                     self._post_pending = False; self._post_fail_time = None
                     self.pose_bunch = None; self.pose_stem = None
                 rospy.sleep(0.01)
@@ -1379,7 +1536,8 @@ class FoundationPosePipelineTracker:
             self.frame_count += 1
 
             # 先抓果串 Top-1（供兩種模式使用）
-            bunch_xyxy, bunch_conf = self.pick_top1(self.color, self.cls_bunch)
+            xyxy_all, sc_all, cl_all = self.yolo_det_all(self.detector, self.color, imgsz=self.det_imgsz, conf=self.det_conf)
+            bunch_xyxy, bunch_conf = self.select_yolo_bbox(xyxy_all, sc_all, cl_all, img_shape=self.color.shape, prefer_cls=self.cls_bunch, select_mode=getattr(self, "bunch_det_select_mode", self.det_select_mode))
             vis_bgr = self.color.copy()
 
             if self.mode == "BUNCH":
@@ -1387,16 +1545,17 @@ class FoundationPosePipelineTracker:
                 if self.pose_bunch is None:
                     if bunch_xyxy is None:
                         self.pump_windows(vis_bgr, self.depth_vis if self.got_depth else None)
-                        self.confidence_publish("bunch", 0.0, False)
-                        self.confidence_publish("stem",  0.0, False)
+                        self.confidence_publish("bunch", 0.0, False, used_sam)
+                        self.confidence_publish("stem", 0.0, False, used_sam)
                         continue
                     m = self.rect_to_mask(self.depth_m, self.clip_xyxy(bunch_xyxy, *self.rgb_size), expand=self.roi_expand)
                     self.pose_bunch = self.est_bunch.register(K=self.K, rgb=self.color, depth=self.depth_m,
                                                               ob_mask=m, iteration=self.est_refine_iter)
                     if self.pose_bunch is None:
-                        self.confidence_publish("bunch", 0.0, False)
-                        self.confidence_publish("stem",  0.0, False)
+                        self.confidence_publish("bunch", 0.0, False, used_sam)
+                        self.confidence_publish("stem", 0.0, False, used_sam)
                         continue
+                    self._set_registering(2)
                     # 初始化成功後，開啟 SAM 暖機期
                     self.sam_warmup_left_bunch = int(self.occ_sam_warmup_n)
 
@@ -1406,16 +1565,33 @@ class FoundationPosePipelineTracker:
 
                 # 遮蔽率：暖機→SAM；之後→IoU
                 occ, iou_for_bar, used_sam = self.compute_occ_and_iou("bunch")
-                # if self.iou_log:
-                rospy.loginfo_throttle(1.0, f"[BUNCH] occ={occ:.2f}  iou={iou_for_bar:.2f}  warmup={'Y' if used_sam else 'N'}")
+                # === IoU 檢查：連續低於門檻 → 重新抓 ROI ===
+                if self.pose_bunch is not None:
+                    center_pose = self.pose_bunch @ np.linalg.inv(self.to_origin_bunch)
+                    if self.maybe_regrab_roi_by_iou("BUNCH", center_pose):
+                        # 本幀已重新抓 ROI 或清空等待 → 跳過後續
+                        self.confidence_publish("bunch", 0.0, False, used_sam)
+                        self.confidence_publish("stem",  0.0, False, used_sam)
+                        continue
 
-                # 門檻與遲滯
-                if occ >= self.policy_occ_hi:
-                    self._hi_cnt += 1; self._lo_cnt = 0
-                elif occ <= self.policy_occ_lo:
-                    self._lo_cnt += 1; self._hi_cnt = 0
+                # if self.iou_log:
+                if used_sam:
+                    rospy.loginfo_throttle(1.0, f"[BUNCH] occ={occ:.2f} warmup={'Y'} iou={iou_for_bar:.2f}")
                 else:
-                    self._hi_cnt = self._lo_cnt = 0
+                    rospy.loginfo_throttle(1.0, f"[BUNCH] iou={iou_for_bar:.2f} warmup={'N'}")
+                # 門檻與遲滯
+                # if occ >= self.policy_occ_hi:
+                #     self._hi_cnt += 1; self._lo_cnt = 0
+                # elif occ <= self.policy_occ_lo:
+                #     self._lo_cnt += 1; self._hi_cnt = 0
+                # else:
+                #     self._hi_cnt = self._lo_cnt = 0
+                if used_sam:
+                    if occ >= self.policy_occ_hi:
+                        self._hi_cnt += 1
+                    else:
+                        pass
+                rospy.loginfo_throttle(1.0, f"[BUNCH] hi_cnt={self._hi_cnt}")
 
                 # 遮蔽連續高 → 切 STEM
                 if self._hi_cnt >= self.policy_hi_pat:
@@ -1426,9 +1602,10 @@ class FoundationPosePipelineTracker:
                                                                 ob_mask=m, iteration=self.est_refine_iter)
                         if self.pose_stem is not None:
                             self.mode = "STEM"
-                            self._hi_cnt = self._lo_cnt = 0
-                            self.confidence_publish("bunch", 0.0, False)
-                            self.confidence_publish("stem",  0.0, False)
+                            self._hi_cnt = 0
+                            # self._lo_cnt = 0
+                            self.confidence_publish("bunch", 0.0, False, used_sam)
+                            self.confidence_publish("stem",  0.0, False, used_sam)
                             self.pump_windows(vis_bgr if self.show_rgb_win else None,
                                               self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
                             continue
@@ -1439,18 +1616,9 @@ class FoundationPosePipelineTracker:
                     cv2.putText(vis_bgr, "Post-check pending...", (10,90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
                     self.pump_windows(vis_bgr if self.show_rgb_win else None,
                                       self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
-                    self.confidence_publish("bunch", 0.0, False)
-                    self.confidence_publish("stem",  0.0, False)
+                    self.confidence_publish("bunch", 0.0, False, used_sam)
+                    self.confidence_publish("stem",  0.0, False, used_sam)
                     continue
-
-                # === IoU 檢查：連續低於門檻 → 重新抓 ROI ===
-                if self.pose_bunch is not None:
-                    center_pose = self.pose_bunch @ np.linalg.inv(self.to_origin_bunch)
-                    if self.maybe_regrab_roi_by_iou("BUNCH", center_pose):
-                        # 本幀已重新抓 ROI 或清空等待 → 跳過後續
-                        self.confidence_publish("bunch", 0.0, False)
-                        self.confidence_publish("stem",  0.0, False)
-                        continue
 
                 # 可視化 + TF（果串）
                 if ok_to_publish and self.pose_bunch is not None:
@@ -1462,30 +1630,32 @@ class FoundationPosePipelineTracker:
                     vis_bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
                     parent_frame = self.camera_tf if self.camera_tf else "camera_color_optical_frame"
                     self.broadcast_transform_and_pose(self.pose_bunch, "bunch", parent_frame)
-                    self.confidence_publish("bunch", 1.0, True)
+                    self.confidence_publish("bunch", 1.0, True, used_sam)
                     # self.save_pose_bbox_debug(vis_bgr, tag="BUNCH")
 
             else:  # STEM 模式
                 # 初始化
+                self._hi_cnt = 0
                 if self.pose_stem is None:
                     if bunch_xyxy is None:
                         self.pump_windows(vis_bgr, self.depth_vis if self.got_depth else None)
-                        self.confidence_publish("bunch", 0.0, False)
-                        self.confidence_publish("stem",  0.0, False)
+                        self.confidence_publish("bunch", 0.0, False, used_sam)
+                        self.confidence_publish("stem",  0.0, False, used_sam)
                         continue
                     stem_xyxy, _ = self.pick_nearest(self.color, bunch_xyxy, self.cls_stem)
                     if stem_xyxy is None:
                         self.pump_windows(vis_bgr, self.depth_vis if self.got_depth else None)
-                        self.confidence_publish("bunch", 0.0, False)
-                        self.confidence_publish("stem",  0.0, False)
+                        self.confidence_publish("bunch", 0.0, False, used_sam)
+                        self.confidence_publish("stem",  0.0, False, used_sam)
                         continue
                     m = self.rect_to_mask(self.depth_m, self.clip_xyxy(stem_xyxy, *self.rgb_size), expand=self.roi_expand)
                     self.pose_stem = self.est_stem.register(K=self.K, rgb=self.color, depth=self.depth_m,
                                                             ob_mask=m, iteration=self.est_refine_iter)
                     if self.pose_stem is None:
-                        self.confidence_publish("bunch", 0.0, False)
-                        self.confidence_publish("stem",  0.0, False)
+                        self.confidence_publish("bunch", 0.0, False, used_sam)
+                        self.confidence_publish("stem",  0.0, False, used_sam)
                         continue
+                    self._set_registering(2)
                     # 切 STEM 後，回到 BUNCH 的 recheck 依然會走 IoU（不使用 SAM）
 
                 # 追蹤葉莖
@@ -1505,28 +1675,28 @@ class FoundationPosePipelineTracker:
                                                                 ob_mask=m, iteration=self.est_refine_iter)
                     if self.pose_stem is None:
                         # 還是沒抓到就下個迭代再試，維持 STEM 與 0 conf
-                        self.confidence_publish("stem", 0.0, False)
+                        self.confidence_publish("stem", 0.0, False, used_sam)
                         self.pump_windows(vis_bgr if self.show_rgb_win else None,
                                         self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
                         continue
                 # 週期性輕量檢查果串是否已不遮蔽 → 回 BUNCH（用 IoU）
-                if (self.policy_allow_bunch_recheck and self.ready_received.detection_allowed and (self.frame_count % max(1, self.policy_recheckN)) == 0 and bunch_xyxy is not None):
-                    mm = self.rect_to_mask(self.depth_m, self.clip_xyxy(bunch_xyxy, *self.rgb_size), expand=self.roi_expand)
-                    pose_test = self.est_bunch.register(K=self.K, rgb=self.color, depth=self.depth_m,
-                                                        ob_mask=mm, iteration=max(1, self.policy_light_it))
-                    if pose_test is not None:
-                        try:
-                            center_pose = pose_test @ np.linalg.inv(self.to_origin_bunch)
-                            occ = self.occ_from_iou(bunch_xyxy, self.K, center_pose, self.bbox_bunch, self.color.shape, self.color)
-                            rospy.loginfo(f"[RECHECK] occ={occ:.2f}")
-                            if occ <= self.policy_occ_lo:
-                                self.mode = "BUNCH"
-                                self.pose_bunch = pose_test
-                                self._hi_cnt = self._lo_cnt = 0
-                                # 回到 BUNCH 時重新開啟一小段暖機（可選：不開亦可）
-                                self.sam_warmup_left_bunch = int(self.occ_sam_warmup_n)
-                        except Exception as e:
-                            rospy.logwarn_throttle(1.0, f"[RECHECK] occ failed: {e}")
+                # if (self.policy_allow_bunch_recheck and self.ready_received.detection_allowed and (self.frame_count % max(1, self.policy_recheckN)) == 0 and bunch_xyxy is not None):
+                #     mm = self.rect_to_mask(self.depth_m, self.clip_xyxy(bunch_xyxy, *self.rgb_size), expand=self.roi_expand)
+                #     pose_test = self.est_bunch.register(K=self.K, rgb=self.color, depth=self.depth_m,
+                #                                         ob_mask=mm, iteration=max(1, self.policy_light_it))
+                #     if pose_test is not None:
+                #         try:
+                #             center_pose = pose_test @ np.linalg.inv(self.to_origin_bunch)
+                #             occ = self.occ_from_iou(bunch_xyxy, self.K, center_pose, self.bbox_bunch, self.color.shape, self.color)
+                #             rospy.loginfo(f"[RECHECK] occ={occ:.2f}")
+                #             if occ <= self.policy_occ_lo:
+                #                 self.mode = "BUNCH"
+                #                 self.pose_bunch = pose_test
+                #                 self._hi_cnt = self._lo_cnt = 0
+                #                 # 回到 BUNCH 時重新開啟一小段暖機（可選：不開亦可）
+                #                 self.sam_warmup_left_bunch = int(self.occ_sam_warmup_n)
+                #         except Exception as e:
+                #             rospy.logwarn_throttle(1.0, f"[RECHECK] occ failed: {e}")
 
                 # 後處理（方向/尺寸）
                 ok_to_publish, pending = self.postprocess_and_maybe_reinit(self.pose_stem, which="stem")
@@ -1534,16 +1704,16 @@ class FoundationPosePipelineTracker:
                     cv2.putText(vis_bgr, "Post-check pending...", (10,90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
                     self.pump_windows(vis_bgr if self.show_rgb_win else None,
                                       self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
-                    self.confidence_publish("bunch", 0.0, False)
-                    self.confidence_publish("stem",  0.0, False)
+                    self.confidence_publish("bunch", 0.0, False, used_sam)
+                    self.confidence_publish("stem",  0.0, False, used_sam)
                     continue
 
                 # === IoU 檢查：連續低於門檻 → 重新抓 ROI ===
                 if self.pose_stem is not None:
                     center_pose = self.pose_stem @ np.linalg.inv(self.to_origin_stem)
                     if self.maybe_regrab_roi_by_iou("STEM", center_pose):
-                        self.confidence_publish("bunch", 0.0, False)
-                        self.confidence_publish("stem",  0.0, False)
+                        self.confidence_publish("bunch", 0.0, False, used_sam)
+                        self.confidence_publish("stem",  0.0, False, used_sam)
                         continue
 
                 # 可視化 + TF（葉莖）
@@ -1556,7 +1726,7 @@ class FoundationPosePipelineTracker:
                     vis_bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
                     parent_frame = self.camera_tf if self.camera_tf else "camera_color_optical_frame"
                     self.broadcast_transform_and_pose(self.pose_stem, "stem", parent_frame)
-                    self.confidence_publish("stem",  1.0, True)
+                    self.confidence_publish("stem",  1.0, True, used_sam)
                     # self.save_pose_bbox_debug(vis_bgr, tag="STEM")
             # 只在 self.iou_val 有值時才畫，或給預設值
             bar_w, bar_h, margin = 220, 18, 10
@@ -1580,3 +1750,74 @@ if __name__ == "__main__":
     rospy.init_node("pipeline_tracker", anonymous=False)
     node = FoundationPosePipelineTracker()
     node.spin()
+
+'''
+    def seg_mask_from_sam(self, bgr, xyxy):
+        """用 FastSAM（bbox prompt）產生二值 mask（bool）。若不可用則回 bbox mask。"""
+        H, W = bgr.shape[:2]
+        if xyxy is None:
+            return np.zeros((H, W), dtype=bool)
+
+        x1, y1, x2, y2 = self.clip_xyxy(xyxy, W, H).astype(np.int32)
+
+        # Fallback: bbox mask
+        def _bbox_mask():
+            m = np.zeros((H, W), dtype=bool)
+            m[y1:y2, x1:x2] = True
+            return m
+
+        if self.seg_backend != "fastsam" or self.fastsam_model is None:
+            return _bbox_mask()
+
+        try:
+            # FastSAM expects RGB
+            img_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+            # Run FastSAM
+            # Note: FastSAM returns results similar to Ultralytics; FastSAMPrompt handles masks.
+            results = self.fastsam_model(
+                img_rgb,
+                device=self._fastsam_device,
+                imgsz=self.fastsam_imgsz,
+                conf=self.fastsam_conf,
+                iou=self.fastsam_iou,
+                retina_masks=True,
+                verbose=False
+            )
+
+            prompt = FastSAMPrompt(img_rgb, results, device=self._fastsam_device)
+
+            # box prompt expects [x1,y1,x2,y2]
+            ann = prompt.box_prompt(bbox=[int(x1), int(y1), int(x2), int(y2)])
+
+            # ann 可能是 list/np array/torch tensor，整理成 HxW bool
+            if ann is None:
+                return _bbox_mask()
+
+            # 常見情況：ann 是 (N,H,W) or (H,W)
+            if isinstance(ann, (list, tuple)):
+                if len(ann) == 0:
+                    return _bbox_mask()
+                ann = ann[0]
+
+            if torch.is_tensor(ann):
+                ann = ann.detach().cpu().numpy()
+
+            ann = np.asarray(ann)
+            if ann.ndim == 3:
+                # 取面積最大那張（更穩）
+                areas = ann.reshape(ann.shape[0], -1).sum(axis=1)
+                ann = ann[int(np.argmax(areas))]
+
+            mask = (ann > 0).astype(bool)
+
+            # 有些版本回傳尺寸可能不是原圖，保險 resize
+            if mask.shape[0] != H or mask.shape[1] != W:
+                mask = cv2.resize(mask.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+            return mask
+
+        except Exception as e:
+            rospy.logwarn_throttle(1.0, f"[FastSAM] box_prompt failed: {e}. Fallback bbox mask.")
+            return _bbox_mask()
+'''

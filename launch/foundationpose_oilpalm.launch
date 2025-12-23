@@ -6,12 +6,12 @@
   <arg name="camera_tf"               default="camera_color_optical_frame"/> <!-- 追蹤結果所對應的parent frame -->
   <arg name="object_name"             default="oilpalm"/> <!-- 追蹤到的物件名稱 TF child frame；Pose的topic -->
 
-  <arg name="det_model"               default="$(find ros_foundationpose)/data/oilpalm_stem.pt"/> <!-- 物件偵測（.onnx/.pt） -->
+  <arg name="det_model"               default="$(find ros_foundationpose)/data/oilpalm_stem.onnx"/> <!-- 物件偵測（.onnx/.pt） -->
   <arg name="mesh_file"               default="$(find ros_foundationpose)/data/oilpalm/oilpalm.obj"/> <!-- 3D mesh（.obj） -->
   <arg name="debug_dir"               default="$(find ros_foundationpose)/log"/> <!-- 偵錯/紀錄輸出目錄 -->
 
   <arg name="init_mode"               default="yolo"/> <!-- 初始化方式： yolo or click -->
-  <arg name="yolo_start_mode"         default="immediate"/> <!-- yolo初始化時機： immediate / wait -->
+  <arg name="yolo_start_mode"         default="wait"/> <!-- yolo初始化時機： immediate / wait -->
 
   <arg name="det_conf"                default="0.25"/>  <!-- yolo信心門檻 -->
   <arg name="det_class"               default="0"/>    <!-- 指定類別；-1 表不限 -->
@@ -24,7 +24,7 @@
   <arg name="roi_expand"              default="0.01"/>  <!-- 以偵測框為中心擴張 ROI 的比例 -->
   <arg name="iou_stride"              default="3"/>     <!-- 每N幀計算一次YOLO vs 估測框 IoU -->
   <arg name="iou_log"                 default="false"/> <!-- 是否在log輸出IoU -->
-  <arg name="iou_thresh"              default="0.25"/>   <!-- IoU門檻（過低觸發重新初始化） -->
+  <arg name="iou_thresh"              default="0.1"/>   <!-- IoU門檻（過低觸發重新初始化） -->
   <arg name="iou_patience"            default="3"/>     <!-- 連續幾幀低於門檻才重新初始化 -->
 
   <arg name="show_depth_window"       default="false"/> <!-- 顯示depth視窗；可在執行中按D切換 -->
@@ -37,7 +37,7 @@
   <arg name="colormap"                default="2"/> <!-- 依 OpenCV colormap 常數（例如：COLORMAP_JET=2）；可自行替換 -->
   <arg name="invert_colormap"         default="false"/> <!-- 是否反相（近亮遠暗/或相反） -->
 
-  <arg name="pp_enable"               default="true"/> <!-- 是否啟用後處理 -->
+  <arg name="pp_enable"               default="false"/> <!-- 是否啟用後處理 -->
   <arg name="pp_up_axis"              default="y"/> <!-- 模型上軸：x/y/z -->
   <arg name="pp_expect_orientation"   default="inverted"/> <!-- 'upright' 或 'inverted' -->
   <arg name="pp_orient_center_tol_px" default="20.0"/> <!-- 方向容許中心偏移(px) -->
