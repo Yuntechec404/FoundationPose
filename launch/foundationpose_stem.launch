@@ -6,7 +6,7 @@
   <arg name="camera_tf"               default="camera_color_optical_frame"/> <!-- 追蹤結果所對應的parent frame -->
   <arg name="object_name"             default="curved_stem"/> <!-- 追蹤到的物件名稱 TF child frame；Pose的topic -->
 
-  <arg name="det_model"               default="$(find ros_foundationpose)/data/oilpalm_stem.pt"/> <!-- 物件偵測（.onnx/.pt） -->
+  <arg name="det_model"               default="$(find ros_foundationpose)/data/oilpalm_stem.onnx"/> <!-- 物件偵測（.onnx/.pt） -->
   <arg name="mesh_file"               default="$(find ros_foundationpose)/data/curved_stem/curved_stem.obj"/> <!-- 3D mesh（.obj） -->
   <arg name="debug_dir"               default="$(find ros_foundationpose)/log"/> <!-- 偵錯/紀錄輸出目錄 -->
 

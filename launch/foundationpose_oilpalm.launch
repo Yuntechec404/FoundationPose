@@ -11,7 +11,7 @@
   <arg name="debug_dir"               default="$(find ros_foundationpose)/log"/> <!-- 偵錯/紀錄輸出目錄 -->
 
   <arg name="init_mode"               default="yolo"/> <!-- 初始化方式： yolo or click -->
-  <arg name="yolo_start_mode"         default="wait"/> <!-- yolo初始化時機： immediate / wait -->
+  <arg name="yolo_start_mode"         default="immediate"/> <!-- yolo初始化時機： immediate / wait -->
 
   <arg name="det_conf"                default="0.25"/>  <!-- yolo信心門檻 -->
   <arg name="det_class"               default="0"/>    <!-- 指定類別；-1 表不限 -->

@@ -7,31 +7,26 @@
   <arg name="camera_tf" default="camera_color_optical_frame"/>
   <arg name="bunch_name" default="oilpalm"/>
   <arg name="stem_name" default="stem"/>
+  <arg name="camera_side" default="right"/> <!--left or right/-->
+  <arg name="camera_tag_offset_x" default="0.03"/> <!--對位目標點與tag的左右偏移量/-->
 
   <!-- 檔案 -->
   <arg name="det_model" default="$(find ros_foundationpose)/data/oilpalm_stem.onnx"/>
-  <arg name="mesh_file" default="$(find ros_foundationpose)/data/oilpalm/oilpalm.obj"/> <!-- 果串 mesh -->
-  <arg name="mesh_file_stem" default="$(find ros_foundationpose)/data/curved_stem/curved_stem.obj"/>  <!-- 葉莖 mesh -->
+  <arg name="mesh_file" default="$(find ros_foundationpose)/data/oilpalm/oilpalm.obj"/>
   <arg name="debug_dir" default="$(find ros_foundationpose)/log"/>
-
-  <!-- 模式 / 演算法 -->
-  <arg name="init_mode" default="yolo"/> <!-- yolo | click -->
-  <arg name="yolo_start_mode" default="wait"/> <!-- immediate | wait -->
-
-  <!-- YOLO -->
+  <arg name="init_mode" default="yolo"/>
+  <arg name="yolo_start_mode" default="wait"/>
   <arg name="det_conf" default="0.25"/>
-  <arg name="det_class" default="-1"/> <!-- 不限 -->
+  <arg name="det_class" default="-1"/>
   <arg name="det_imgsz" default="640"/>
-  <arg name="det_select_mode" default="score"/> <!-- score | middle | nearest_depth -->
-
-  <!-- FoundationPose iters -->
+  <arg name="det_select_mode" default="nearest_depth"/>  <!-- middle | score |nearest_depth -->
   <arg name="est_refine_iter" default="5"/>
   <arg name="track_refine_iter" default="2"/>
 
   <!-- IoU / ROI -->
   <arg name="roi_expand" default="0.01"/>
   <arg name="iou_stride" default="3"/>
-  <arg name="iou_log" default="true"/>
+  <arg name="iou_log" default="false"/>
   <arg name="iou_thresh" default="0.2"/>
   <arg name="iou_patience" default="3"/>
 
@@ -46,13 +41,13 @@
   <arg name="colormap" default="2"/>
   <arg name="invert_colormap" default="false"/>
 
-  <!-- 後處理（共用） -->
+  <!-- 後處理 -->
   <arg name="pp_enable" default="true"/>
   <arg name="pp_orient_center_tol_px" default="20.0"/>
 
   <!-- 果串（BUNCH） -->
   <arg name="pp_bunch_expect_orientation" default="inverted"/>
-  <arg name="pp_bunch_size_mode" default="bbox_mm"/> <!-- bbox_mm | depth -->
+  <arg name="pp_bunch_size_mode" default="bbox_mm"/>
   <arg name="pp_bunch_expect_bbox_w_mm" default="115.0"/>
   <arg name="pp_bunch_expect_bbox_h_mm" default="80.0"/>
   <arg name="pp_bunch_size_ratio_min" default="0.6"/>
@@ -60,30 +55,24 @@
   <arg name="pp_bunch_depth_tol_m" default="0.25"/>
 
   <!-- 葉莖（STEM） -->
-  <arg name="pp_stem_expect_orientation" default="inverted"/>
-  <arg name="pp_stem_size_mode" default="bbox_mm"/>
-  <arg name="pp_stem_expect_bbox_w_mm" default="115.0"/>
-  <arg name="pp_stem_expect_bbox_h_mm" default="500.0"/>
-  <arg name="pp_stem_size_ratio_min" default="0.6"/>
-  <arg name="pp_stem_expect_depth_m" default="1.2"/>
-  <arg name="pp_stem_depth_tol_m" default="0.25"/>
+  <arg name="cmd_vel_topic" default="/cmd_vel" />
+  <arg name="stem_lost" default="3.0" />
+  <arg name="stem_depth_min" default="0.1" />
+  <arg name="stem_depth_max" default="3.0" />
+  <arg name="stem_assumed_radius" default="0.0" />
+  <arg name="max_dist_px" default="50" />
+  <arg name="tracker_type" default="bytetrack.yaml"/> <!-- bytetrack.yaml | botsort.yaml -->
 
   <!-- 分類 id（你的資料集 class id） -->
   <arg name="cls_bunch" default="0"/>
   <arg name="cls_stem" default="1"/>
 
   <!-- 遮蔽率策略 -->
-  <arg name="policy_occ_thresh_high" default="0.90"/> <!-- 高於→切 STEM -->
+  <arg name="policy_occ_thresh_high" default="0.7"/>
   <arg name="policy_high_patience" default="5"/>
 
-  <!-- 分割後端（SAM 可選） -->
-  <arg name="seg_backend" default="sam2"/> <!-- sam | bbox -->
-  <arg name="sam_model" default="vit_h"/>
-  <arg name="sam_ckpt" default="$(find ros_foundationpose)/data/sam2_s.pt"/>
-  <arg name="occ_sam_warmup_n" default="8"/> <!-- 初始化成功後，前 N 幀用 SAM；之後改 IoU -->
-
-  <node pkg="ros_foundationpose" type="pipeline_tracker_sam2.py" name="pipeline_tracker" output="screen">
-    <!-- Topics / Frames -->
+  <arg name="seg_backend" default="yolo_seg"/> <arg name="seg_model" default="$(find ros_foundationpose)/data/bunch_stem-seg.onnx"/>
+  <arg name="occ_seg_warmup_n" default="8"/> <node pkg="ros_foundationpose" type="pipeline_tracker_yoloseg.py" name="pipeline_tracker" output="screen">
     <param name="image_topic" value="$(arg image_topic)"/>
     <param name="info_topic" value="$(arg info_topic)"/>
     <param name="depth_topic" value="$(arg depth_topic)"/>
@@ -91,14 +80,13 @@
     <param name="camera_tf" value="$(arg camera_tf)"/>
     <param name="bunch_name" value="$(arg bunch_name)"/>
     <param name="stem_name" value="$(arg stem_name)"/>
+    <param name="camera_side" value="$(arg camera_side)"/>
+    <param name="camera_tag_offset_x" value="$(arg camera_tag_offset_x)"/>
 
-    <!-- 檔案 -->
     <param name="det_model" value="$(arg det_model)"/>
     <param name="mesh_file" value="$(arg mesh_file)"/>
-    <param name="mesh_file_stem" value="$(arg mesh_file_stem)"/>
     <param name="debug_dir" value="$(arg debug_dir)"/>
 
-    <!-- 模式 / 演算法 -->
     <param name="init_mode" value="$(arg init_mode)"/>
     <param name="yolo_start_mode" value="$(arg yolo_start_mode)"/>
     <param name="det_conf" value="$(arg det_conf)"/>
@@ -108,14 +96,12 @@
     <param name="est_refine_iter" value="$(arg est_refine_iter)"/>
     <param name="track_refine_iter" value="$(arg track_refine_iter)"/>
 
-    <!-- 追蹤 / IoU -->
     <param name="roi_expand" value="$(arg roi_expand)"/>
     <param name="iou_stride" value="$(arg iou_stride)"/>
     <param name="iou_log" value="$(arg iou_log)"/>
     <param name="iou_thresh" value="$(arg iou_thresh)"/>
     <param name="iou_patience" value="$(arg iou_patience)"/>
 
-    <!-- 視窗 -->
     <param name="show_depth_window" value="$(arg show_depth_window)"/>
     <param name="show_rgb_window" value="$(arg show_rgb_window)"/>
     <param name="depth_win_name" value="$(arg depth_win_name)"/>
@@ -126,11 +112,9 @@
     <param name="colormap" value="$(arg colormap)"/>
     <param name="invert_colormap" value="$(arg invert_colormap)"/>
 
-    <!-- 後處理（共用） -->
     <param name="postproc/enable" value="$(arg pp_enable)"/>
     <param name="postproc/orient_center_tol_px" value="$(arg pp_orient_center_tol_px)"/>
 
-    <!-- 果串（BUNCH） -->
     <param name="postproc/bunch/expect_orientation" value ="$(arg pp_bunch_expect_orientation)"/>
     <param name="postproc/bunch/size_mode" value ="$(arg pp_bunch_size_mode)"/>
     <param name="postproc/bunch/expect_bbox_w_mm" value ="$(arg pp_bunch_expect_bbox_w_mm)"/>
@@ -139,26 +123,24 @@
     <param name="postproc/bunch/expect_depth_m" value ="$(arg pp_bunch_expect_depth_m)"/>
     <param name="postproc/bunch/depth_tolerance_m" value ="$(arg pp_bunch_depth_tol_m)"/>
 
-    <!-- 葉莖（STEM） -->
-    <param name="postproc/stem/expect_orientation" value ="$(arg pp_stem_expect_orientation)"/>
-    <param name="postproc/stem/size_mode" value ="$(arg pp_stem_size_mode)"/>
-    <param name="postproc/stem/expect_bbox_w_mm" value ="$(arg pp_stem_expect_bbox_w_mm)"/>
-    <param name="postproc/stem/expect_bbox_h_mm" value ="$(arg pp_stem_expect_bbox_h_mm)"/>
-    <param name="postproc/stem/size_ratio_min" value ="$(arg pp_stem_size_ratio_min)"/>
-    <param name="postproc/stem/expect_depth_m" value ="$(arg pp_stem_expect_depth_m)"/>
-    <param name="postproc/stem/depth_tolerance_m" value ="$(arg pp_stem_depth_tol_m)"/>
+    <param name="postproc/stem/cmd_vel_topic" value="$(arg cmd_vel_topic)" />
+    <param name="postproc/stem/stem_lost" value="$(arg stem_lost)" />
+    <param name="postproc/stem/stem_depth_min" value="$(arg stem_depth_min)" />
+    <param name="postproc/stem/stem_depth_max" value="$(arg stem_depth_max)" />
+    <param name="postproc/stem/stem_assumed_radius" value="$(arg stem_assumed_radius)" />
+    <param name="postproc/stem/max_dist_px" value="$(arg max_dist_px)" />
+    <param name="tracker_type" value="$(arg tracker_type)"/>
 
-    <!-- 類別 id / 策略 -->
     <param name="classes/bunch" value ="$(arg cls_bunch)"/>
     <param name="classes/stem" value ="$(arg cls_stem)"/>
     <param name="policy/occ_thresh_high" value ="$(arg policy_occ_thresh_high)"/>
     <param name="policy/high_patience" value ="$(arg policy_high_patience)"/>
 
-    <!-- 分割 -->
     <param name="postproc/seg_backend" value ="$(arg seg_backend)"/>
-    <param name="postproc/sam_model" value ="$(arg sam_model)"/>
-    <param name="postproc/sam_ckpt" value ="$(arg sam_ckpt)"/>
-    <param name="postproc/sam_imgsz" value ="$(arg det_imgsz)"/>
-    <param name="occ/sam_warmup_n" value="$(arg occ_sam_warmup_n)"/>
+    <param name="postproc/seg_model" value ="$(arg seg_model)"/>
+    <param name="postproc/seg_imgsz" value ="$(arg det_imgsz)"/>
+    <param name="postproc/seg_conf" value ="$(arg det_conf)"/>
+    <param name="postproc/seg_iou" value ="$(arg iou_thresh)"/>
+    <param name="occ/seg_warmup_n" value="$(arg occ_seg_warmup_n)"/>
   </node>
 </launch>

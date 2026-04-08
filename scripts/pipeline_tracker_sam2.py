@@ -8,11 +8,14 @@ import numpy as np
 import cv2
 import trimesh
 import torch
+import time
+import psutil
 
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import Pose, Transform
+from geometry_msgs.msg import Pose, Transform, Point, Quaternion
 from cv_bridge import CvBridge
 from forklift_msg.msg import Confidence, Detection
+from std_msgs.msg import Bool
 from datetime import datetime
 
 import tf
@@ -33,6 +36,7 @@ os.environ.setdefault("ULTRALYTICS_NO_INSTALL", "1")
 
 from estimater import FoundationPose, draw_posed_3d_box, draw_xyz_axis, ScorePredictor, PoseRefinePredictor, dr
 from ultralytics import YOLO, SAM
+from ultralytics.models.sam import SAM2DynamicInteractivePredictor
 
 # SAM
 # try:
@@ -48,7 +52,8 @@ class FoundationPosePipelineTracker:
     def __init__(self):
         self.init_parameter()
         # debug_dir: {debug_root}/{yyyyMMdd-HHmm}/
-        self._setup_run_debug_dir()
+        if self.iou_log:
+            self._setup_run_debug_dir()
         try:
             cv2.destroyAllWindows()
         except Exception:
@@ -75,11 +80,15 @@ class FoundationPosePipelineTracker:
         self.last_iou_update_stem  = -1
         self.K = None
         self._last_yolo_text = ""
-        self.bunch_ready_received = Detection()
-        self.bunch_ready_received.detection_allowed = False
-        self.stem_ready_received = Detection()
-        self.stem_ready_received.detection_allowed = False
+        # Unified detection gating (bunch+stem share the same topic)
+        self.ready_received = Detection()
+        self.ready_received.detection_allowed = False
+        # current detection select mode (affects BUNCH only)
+        self.det_select_mode_current = getattr(self, "det_select_mode", "score")
         self._force_bunch_detect = False   # reinit 後強制果串檢測直到被 block
+        self._stem_lock = False
+        self._pause_hold = False
+        self._last_allowed = False
         
         # YOLO 延時 debounce 狀態
         self._yolo_delay_left_bunch = 0
@@ -90,6 +99,12 @@ class FoundationPosePipelineTracker:
         # SAM 暖機幀數計數器
         self.sam_warmup_left_bunch = 0
         self.sam_warmup_left_stem = 0
+
+        # 遮蔽率效能分析器
+        self.perf_nn_times = []     # 紀錄 AI 推論時間
+        self.perf_mesh_times = []   # 紀錄網格交集時間
+        self.perf_occ_cpu = []      # 紀錄整體 CPU 佔用
+        self.perf_process = psutil.Process(os.getpid()) if 'psutil' in sys.modules else None
 
         # GUI 狀態
         self._rgb_win_created = False
@@ -107,17 +122,13 @@ class FoundationPosePipelineTracker:
         self.image_sub = rospy.Subscriber(self.image_topic, Image, self.imageCallback, queue_size=1)
         self.depth_sub = rospy.Subscriber(self.depth_topic, Image, self.depthCallback, queue_size=1)
         self.info_sub  = rospy.Subscriber(self.info_topic,  CameraInfo, self.infoCallback, queue_size=1)
+
         self.tf_broadcaster = tf.TransformBroadcaster()
-        # Pose publishers
-        self.pose_pub_bunch = rospy.Publisher(self.bunch_name, Pose, queue_size=1, latch=True)
-        self.pose_pub_stem  = rospy.Publisher(self.stem_name,  Pose, queue_size=1, latch=True)
-        # Confidence publishers
-        self.conf_pub_bunch = rospy.Publisher(self.bunch_name + "_confidence", Confidence, queue_size=1, latch=True)
-        self.conf_pub_stem  = rospy.Publisher(self.stem_name  + "_confidence", Confidence, queue_size=1, latch=True)
-        # Optional: detection gating topic → 掛在 bunch 名稱上
+
+        self.conf_pub = rospy.Publisher(self.bunch_name, Confidence, queue_size=1, latch=True)
+        self.harvest_done_sub = rospy.Subscriber(self.bunch_name + "_harvest_done", Bool, self.harvestDoneCallback, queue_size=1)
         if self.yolo_start_mode == "wait":
-            self._ready_sub_bunch = rospy.Subscriber(self.bunch_name + "_detection", Detection, self.bunchdetectionCallback, queue_size=1)
-            self._ready_sub_stem = rospy.Subscriber(self.stem_name + "_detection", Detection, self.stemdetectionCallback, queue_size=1)
+            self._ready_sub = rospy.Subscriber(self.bunch_name + "_detection", Detection, self.detectionCallback, queue_size=1)
 
         self.window_create()
 
@@ -178,27 +189,41 @@ class FoundationPosePipelineTracker:
         #     if self.seg_backend == "sam":
         #         rospy.logwarn("segment_anything not available. Fallback to bbox mask.")
 
-        # SAM2 Ultralytics
-        self.sam2_model = None
+        # SAM2 Ultralytics (Video segmentation w/ memory)
+        self.sam2_model = None               # kept for backward-compat (unused)
+        self.sam2_predictor = None           # SAM2DynamicInteractivePredictor
+        self.sam2_prev_masks = {}            # {obj_id: np.ndarray(H,W) bool}
+        self.sam2_obj_ids = {"bunch": 1, "stem": 2}
+
         if self.seg_backend == "sam2":
             try:
-                self.sam2_model = SAM(self.sam_ckpt)
-                rospy.loginfo(f"[SAM2] Loaded {self.sam_ckpt}")
-
-                # warmup（非常重要，否則第一幀會慢）
-                dummy = np.zeros((self.sam_imgsz, self.sam_imgsz, 3), np.uint8)
-                _ = self.sam2_model(
-                    dummy,
-                    bboxes=[[10,10,100,100]],
+                # Use the dynamic interactive predictor so we can:
+                #  - Box prompt: initial spatial constraint
+                #  - Point prompt: fg/bg refinement
+                #  - Mask prompt: previous-frame mask as constraint (and to update memory)
+                overrides = dict(
+                    conf=0.01,
+                    task="segment",
+                    mode="predict",
                     imgsz=self.sam_imgsz,
-                    device = "cuda:0" if torch.cuda.is_available() else "cpu",
-                    verbose=False
+                    model=self.sam_ckpt,
+                    save=False,
+                )
+                self.sam2_predictor = SAM2DynamicInteractivePredictor(overrides=overrides, max_obj_num=3)
+                rospy.loginfo(f"[SAM2] DynamicInteractivePredictor loaded: {self.sam_ckpt}")
+
+                # warmup
+                dummy = np.zeros((self.sam_imgsz, self.sam_imgsz, 3), np.uint8)
+                _ = self.sam2_predictor(
+                    source=dummy,
+                    bboxes=[[0, 0, self.sam_imgsz - 1, self.sam_imgsz - 1]],
+                    obj_ids=[self.sam2_obj_ids["bunch"]],
+                    update_memory=True,
                 )
                 rospy.loginfo("[SAM2] warmup done")
-
             except Exception as e:
                 rospy.logwarn(f"[SAM2] init failed: {e}")
-                self.sam2_model = None
+                self.sam2_predictor = None
 
         # 狀態機
         self.mode = "BUNCH"     # BUNCH / STEM
@@ -747,7 +772,7 @@ class FoundationPosePipelineTracker:
                 )
                 if new_pose is not None:
                     self.pose_bunch = new_pose
-                    if getattr(self, "bunch_det_select_mode", "") == "middle":
+                    if getattr(self, "det_select_mode_current", self.det_select_mode) == "middle":
                         self._force_bunch_detect = True
                         self._hi_cnt = 0
                     # BUNCH 才需要 SAM warmup
@@ -1010,7 +1035,7 @@ class FoundationPosePipelineTracker:
         return self.sam_warmup_left_bunch if which.lower()=="bunch" else self.sam_warmup_left_stem
 
     def _bunch_skip_occlusion(self) -> bool:
-        mode = getattr(self, "bunch_det_select_mode", self.det_select_mode)
+        mode = getattr(self, "det_select_mode_current", self.det_select_mode)
         return (str(mode).strip().lower() == "middle")
 
     def _dec_warmup_left(self, which: str):
@@ -1020,12 +1045,6 @@ class FoundationPosePipelineTracker:
             if self.sam_warmup_left_stem  > 0: self.sam_warmup_left_stem  -= 1
 
     def compute_occ_and_iou(self, which: str, xyxy_all=None, sc_all=None, cl_all=None):
-        """
-        回傳 (occ, iou, used_sam)
-        - BUNCH 暖機：用 SAM 算 occ（used_sam=True），但 IoU 也用本幀 det arrays 算
-        - 暖機結束：只算 IoU，occ=1-iou
-        - STEM：spin()不會呼叫它（STEM 不做 SAM）
-        """
         occ = 1.0
         if self.color is None or self.K is None:
             return 1.0, 0.0, False
@@ -1047,7 +1066,7 @@ class FoundationPosePipelineTracker:
 
         center_pose = pose @ np.linalg.inv(to_origin)
 
-        # ✅ IoU：使用本幀 det arrays（不再跑 YOLO）
+        # IoU：使用本幀 det arrays
         iou_val, best_xyxy = self.iou_vs_projection_for_class_from_dets(
             self.color, self.K, center_pose, bbox,
             prefer_cls=prefer_cls,
@@ -1057,15 +1076,89 @@ class FoundationPosePipelineTracker:
 
         skip_occlusion_check = (which_l == "bunch" and self._force_bunch_detect)
 
+        # ==========================================
+        # 暖機階段 (Warmup): 執行 SAM 分割與遮蔽率計算
+        # ==========================================
         if (not skip_occlusion_check) and (which_l == "bunch") and (self._get_warmup_left(which_l) > 0):
             self._dec_warmup_left(which_l)
+            
+            # 暖機剛好結束的瞬間：觸發效能結算報告
             if self._get_warmup_left(which_l) == 0:
-                rospy.loginfo(f"[{which_l.upper()}] SAM warmup finished, switch to IoU-only mode")
-                return 1.0, (0.0 if iou_val is None else float(iou_val)), False
+                rospy.loginfo(f"[{which_l.upper()}] SAM warmup finished, switch to IoU-only mode (skip occ)")
+                
+                # ===== [嚴謹效能結算與輸出 - 僅在 iou_log == True 時執行] =====
+                if getattr(self, "iou_log", False) and hasattr(self, 'perf_nn_times') and len(self.perf_nn_times) > 0:
+                    avg_nn = float(np.mean(self.perf_nn_times))
+                    avg_mesh = float(np.mean(self.perf_mesh_times))
+                    avg_cpu = float(np.mean(self.perf_occ_cpu))
+                    gpu_mem_mb = torch.cuda.max_memory_allocated() / (1024**2) if torch.cuda.is_available() else 0.0
+                    
+                    rospy.loginfo("====== [SAM2 OCCLUSION PERFORMANCE] ======")
+                    rospy.loginfo(f"Warmup Frames     : {len(self.perf_nn_times)}")
+                    rospy.loginfo(f"Avg AI Infer Time : {avg_nn:.2f} ms")
+                    rospy.loginfo(f"Avg Mesh Calc Time: {avg_mesh:.2f} ms")
+                    rospy.loginfo(f"Total Avg Time/Fr : {avg_nn + avg_mesh:.2f} ms")
+                    rospy.loginfo(f"Avg CPU Usage     : {avg_cpu:.2f} %")
+                    rospy.loginfo(f"Peak GPU VRAM     : {gpu_mem_mb:.2f} MB")
+                    rospy.loginfo("==========================================")
+                    
+                    try:
+                        import csv
+                        from datetime import datetime
+                        csv_path = os.path.join(self.debug_dir, "occ_sam_performance.csv")
+                        file_exists = os.path.isfile(csv_path)
+                        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                            writer = csv.writer(f)
+                            if not file_exists:
+                                writer.writerow(["Timestamp", "Frames", "Avg_AI_ms", "Avg_Mesh_ms", "Avg_CPU_Percent", "Peak_GPU_Mem_MB"])
+                            writer.writerow([datetime.now().strftime("%Y%m%d_%H%M%S"), len(self.perf_nn_times), round(avg_nn,2), round(avg_mesh,2), round(avg_cpu,2), round(gpu_mem_mb,2)])
+                    except Exception as e:
+                        rospy.logwarn(f"Failed to write sam performance CSV: {e}")
+                    
+                    # 清空數據
+                    self.perf_nn_times.clear()
+                    self.perf_mesh_times.clear()
+                    self.perf_occ_cpu.clear()
+                # ===============================
 
+                return None, (0.0 if iou_val is None else float(iou_val)), False
+
+            # --- [開始測量：僅在 iou_log 為 True 時耗費資源測量] ---
+            if getattr(self, "iou_log", False):
+                import time
+                t_start = time.perf_counter()
+                cpu_start = self.perf_process.cpu_times() if hasattr(self, 'perf_process') and self.perf_process else None
+
+            # [第一階段] 產生提示框與 AI 推論
             prompt_box = self.pose_2d_box_xyxy(which_l)
             seg = self.seg_mask_from_sam(self.color, prompt_box)
+            
+            # --- [中途點：AI 推論結束] ---
+            if getattr(self, "iou_log", False):
+                t_mid = time.perf_counter()
+                nn_time_ms = (t_mid - t_start) * 1000.0
+                if hasattr(self, 'perf_nn_times'):
+                    self.perf_nn_times.append(nn_time_ms)
+
+            # [第二階段] 網格投影與物理交集計算
             occ = self.occ_from_gt_mesh_vs_sam(which_l, seg.astype(bool))
+
+            # --- [結束點：物理計算結束] ---
+            if getattr(self, "iou_log", False):
+                t_end = time.perf_counter()
+                mesh_time_ms = (t_end - t_mid) * 1000.0
+                
+                if cpu_start is not None:
+                    cpu_end = self.perf_process.cpu_times()
+                    cpu_time_spent = (cpu_end.user - cpu_start.user) + (cpu_end.system - cpu_start.system)
+                    cpu_percent = (cpu_time_spent / (t_end - t_start)) * 100.0 if (t_end - t_start) > 0 else 0.0
+                else:
+                    cpu_percent = 0.0
+                    
+                if hasattr(self, 'perf_mesh_times'):
+                    self.perf_mesh_times.append(mesh_time_ms)
+                    self.perf_occ_cpu.append(cpu_percent)
+            # ------------------------------------
 
             if getattr(self, "iou_log", False):
                 try:
@@ -1078,12 +1171,14 @@ class FoundationPosePipelineTracker:
 
             return occ, (0.0 if iou_val is None else float(iou_val)), True
 
-        # 非暖機：IoU-only
+        # ==========================================
+        # 非暖機階段: IoU-only (完全跳過遮蔽率運算)
+        # ==========================================
         if iou_val is None:
-            occ = 1.0
+            occ = None
             iou_show = 0.0
         else:
-            occ = 1.0 - float(iou_val)
+            occ = None
             iou_show = float(iou_val)
 
         if getattr(self, "iou_log", False):
@@ -1105,11 +1200,11 @@ class FoundationPosePipelineTracker:
             center_pose = self.pose_stem @ np.linalg.inv(self.to_origin_stem)
             bbox = self.bbox_stem
         return self.project_3d_bbox_xyxy(self.K, center_pose, bbox, self.color.shape)
-    
+
     def render_mesh_silhouette_mask(self, K, pose_center_in_cam, mesh, img_shape):
         """
-        以 6D pose 將 mesh 投影為 2D 二值 mask（不做 z-buffer，但會只繪製 Z>0 的三角形）。
-        這樣可避免索引錯亂與 inf/NaN 造成的大量漏畫。
+        以 6D pose 將 mesh 投影為 2D 二值 mask。
+        【超高速向量化版本】利用 NumPy 與 OpenCV 批次處理，避免 Python for 迴圈。
         """
         H, W = img_shape[:2]
 
@@ -1118,50 +1213,57 @@ class FoundationPosePipelineTracker:
         Pc = (pose_center_in_cam @ Vh.T).T               # (N,4)
 
         Z = Pc[:, 2]
-        # 投影：僅對 Z>0 的頂點計算 u,v；其餘先填 NaN
-        u = np.full((V.shape[0],), np.nan, dtype=np.float64)
-        v = np.full((V.shape[0],), np.nan, dtype=np.float64)
-        valid = Z > 1e-6
-        u[valid] = K[0,0] * (Pc[valid, 0] / Z[valid]) + K[0,2]
-        v[valid] = K[1,1] * (Pc[valid, 1] / Z[valid]) + K[1,2]
+        valid_Z = Z > 1e-6
+        
+        # 預防除以零的警告
+        Z_safe = Z.copy()
+        Z_safe[~valid_Z] = 1.0
+
+        # 一次性計算所有頂點的 u, v 投影
+        u = K[0,0] * (Pc[:, 0] / Z_safe) + K[0,2]
+        v = K[1,1] * (Pc[:, 1] / Z_safe) + K[1,2]
+
+        # 將 u, v 結合成 (N, 2) 的陣列
+        uv = np.stack([u, v], axis=1)
+
+        # 取得網格的三角形面索引 (M, 3)
+        F = mesh.faces
+        
+        # 利用索引快速映射出所有三角形的 2D 座標，形狀變為 (M, 3, 2)
+        triangles = uv[F]
+
+        # 找出哪些三角形是「有效」的（三個頂點都在相機前方）
+        # valid_Z[F] 會產生 (M, 3) 的布林陣列，.all(axis=1) 表示三個頂點都要 True
+        valid_faces = valid_Z[F].all(axis=1)
+        
+        if not np.any(valid_faces):
+            return np.zeros((H, W), dtype=bool)
+
+        valid_triangles = triangles[valid_faces]
+
+        # 快速視域測試：過濾掉「完全在螢幕外」的三角形
+        MARGIN = 10
+        min_uv = valid_triangles.min(axis=1) # (M_valid, 2)
+        max_uv = valid_triangles.max(axis=1) # (M_valid, 2)
+        
+        in_screen = ~(
+            (min_uv[:, 0] > W + MARGIN) | 
+            (max_uv[:, 0] < -MARGIN) | 
+            (min_uv[:, 1] > H + MARGIN) | 
+            (max_uv[:, 1] < -MARGIN)
+        )
+        
+        final_triangles = valid_triangles[in_screen]
 
         mask = np.zeros((H, W), np.uint8)
-        F = mesh.faces  # (M,3), 使用原索引，不壓縮
+        if final_triangles.shape[0] > 0:
+            # OpenCV 繪圖要求整數，並加上裁切避免內部記憶體溢位
+            final_triangles = np.clip(final_triangles, -2048, W + 2048).astype(np.int32)
+            
+            # 【效能核彈】用 cv2.fillPoly 一次性把所有的三角形畫上去！
+            cv2.fillPoly(mask, final_triangles, 255, lineType=cv2.LINE_AA)
 
-        # 小幅邊界裕度，避免邊界三角形被錯誤判定在畫面外
-        MARGIN = 10
-
-        for f in F:
-            i0, i1, i2 = int(f[0]), int(f[1]), int(f[2])
-
-            # 只畫三個頂點都在相機前方的三角形
-            if (not valid[i0]) or (not valid[i1]) or (not valid[i2]):
-                continue
-
-            pts = np.array([
-                [u[i0], v[i0]],
-                [u[i1], v[i1]],
-                [u[i2], v[i2]],
-            ], dtype=np.float64)
-
-            # 有 NaN 的話跳過
-            if not np.isfinite(pts).all():
-                continue
-
-            # 快速視域測試（全部在螢幕外才略過）
-            if ((pts[:,0] < -MARGIN).all() or (pts[:,0] > W + MARGIN).all() or
-                (pts[:,1] < -MARGIN).all() or (pts[:,1] > H + MARGIN).all()):
-                continue
-
-            # 轉為 int 並裁切寬容邊界，避免 OpenCV 溢位
-            pts_i = pts.copy()
-            pts_i[:,0] = np.clip(pts_i[:,0], -2048, W + 2048)
-            pts_i[:,1] = np.clip(pts_i[:,1], -2048, H + 2048)
-            pts_i = pts_i.astype(np.int32)
-
-            cv2.fillConvexPoly(mask, pts_i, 255, lineType=cv2.LINE_AA)
-
-        return (mask > 0)
+        return (mask > 0)    
 
     def occ_from_gt_mesh_vs_sam(self, which:str, sam_mask_bool: np.ndarray):
         """
@@ -1261,12 +1363,24 @@ class FoundationPosePipelineTracker:
         m_orig = cv2.resize(m_crop.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
         return m_orig.astype(bool)
 
-    def seg_mask_from_sam(self, bgr, xyxy):
+    def seg_mask_from_sam(self, bgr, xyxy, obj_key: str = "bunch", points=None, labels=None, use_prev_mask: bool = True):
         """
-        SAM2 bbox-only segmentation (Ultralytics)
+        SAM2 video-style segmentation using Ultralytics SAM2DynamicInteractivePredictor.
+
+        Prompts:
+          a) Box prompt  : initial spatial constraint (e.g., YOLO bbox)
+          b) Point prompt: optional fg/bg refinement (points + labels)
+          c) Mask prompt : previous-frame mask as constraint + memory update
+
+        Args:
+            bgr: np.ndarray(H,W,3) BGR image
+            xyxy: [x1,y1,x2,y2] bbox in image coordinates
+            obj_key: "bunch" or "stem" (maps to stable obj_id)
+            points: list[[x,y], ...] or list[list[list[x,y]]] (Ultralytics SAM prompt format)
+            labels: list[int] matching points (1=fg, 0=bg)
+            use_prev_mask: whether to feed previous mask as mask prompt
         """
         H, W = bgr.shape[:2]
-
         if xyxy is None:
             return np.zeros((H, W), dtype=bool)
 
@@ -1278,36 +1392,87 @@ class FoundationPosePipelineTracker:
             m[y1:y2, x1:x2] = True
             return m
 
-        if self.sam2_model is None:
+        if self.sam2_predictor is None:
             return _bbox_mask()
 
+        obj_id = int(self.sam2_obj_ids.get(obj_key, 0))
+
+        # ---- build mask prompt from previous frame ----
+        mask_prompt = None
+        if use_prev_mask and (obj_id in self.sam2_prev_masks):
+            pm = self.sam2_prev_masks[obj_id]
+            if pm.shape != (H, W):
+                pm = cv2.resize(pm.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST) > 0
+            # SAM2DynamicInteractivePredictor.update_memory expects (N,H,W) for N objects
+            mask_prompt = pm.astype(np.uint8)[None, :, :]
+
+        # ---- (optional) auto points: center fg + 4 bg outside bbox ----
+        if points is None and labels is None:
+            cx = int(0.5 * (x1 + x2))
+            cy = int(0.5 * (y1 + y2))
+            # 1 fg point at center, 4 bg points near corners (clipped)
+            points = [[cx, cy],
+                      [max(0, x1 - 5), max(0, y1 - 5)],
+                      [min(W - 1, x2 + 5), max(0, y1 - 5)],
+                      [max(0, x1 - 5), min(H - 1, y2 + 5)],
+                      [min(W - 1, x2 + 5), min(H - 1, y2 + 5)]]
+            labels = [1, 0, 0, 0, 0]
+
+        # ---- normalize prompt shapes for Ultralytics SAM2 predictor ----
+        # Ultralytics expects points/labels to be batched (B, K, 2) / (B, K) when using interactive predictor.
+        # If caller provides a flat list of points like [[x,y], ...], wrap it into an outer list for B=1.
+        if points is not None and len(points) > 0 and isinstance(points[0], (list, tuple)) and len(points[0]) == 2 and isinstance(points[0][0], (int, float, np.number)):
+            points = [points]
+        if labels is not None and len(labels) > 0 and isinstance(labels[0], (int, np.integer)):
+            labels = [labels]
+
+        # ---- run predictor ----
         try:
-            results = self.sam2_model(
-                bgr,
-                bboxes=[[int(x1), int(y1), int(x2), int(y2)]],
-                imgsz=self.sam_imgsz,
-                device = "cuda:0" if torch.cuda.is_available() else "cpu",
-                verbose=False
+            # If we have a previous mask, we can just update memory with mask prompt (cheap constraints).
+            # If not, use bbox as initial prompt to bootstrap.
+            use_bbox = mask_prompt is None
+            results = self.sam2_predictor(
+                source=bgr,
+                bboxes=[[int(x1), int(y1), int(x2), int(y2)]] if use_bbox else None,
+                points=points,
+                labels=labels,
+                masks=mask_prompt,
+                obj_ids=[obj_id],
+                update_memory=True,
             )
 
+            # results[0].masks.data can be torch.Tensor or np.ndarray, usually (N,H,W)
             m = results[0].masks.data
             if torch.is_tensor(m):
                 m = m.detach().cpu().numpy()
             m = np.asarray(m)
 
-            if m.ndim == 3:
-                areas = m.reshape(m.shape[0], -1).sum(axis=1)
-                m2 = m[int(np.argmax(areas))]
+            if m.ndim == 2:
+                cand = [m]
+            elif m.ndim == 3:
+                cand = [m[i] for i in range(m.shape[0])]
             else:
-                m2 = m
-            if m2.shape[0] == self.sam_imgsz and m2.shape[1] == self.sam_imgsz:
-                mask = self._unletterbox_mask_to_orig(m2 > 0, (H, W), self.sam_imgsz)
-            else:
-                if m2.shape != (H, W):
-                    m2 = cv2.resize(m2.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
-                mask = (m2 > 0)
+                return _bbox_mask()
 
-            return mask
+            # pick the mask that overlaps bbox most (robust when predictor returns multiple objs)
+            best = None
+            best_score = -1.0
+            for mm in cand:
+                mm_bin = (mm > 0)
+                inter = mm_bin[y1:y2, x1:x2].sum()
+                area = mm_bin.sum() + 1e-6
+                score = float(inter / area)
+                if score > best_score:
+                    best_score = score
+                    best = mm_bin
+
+            if best is None:
+                return _bbox_mask()
+
+            # cache for next frame (mask prompt)
+            self.sam2_prev_masks[obj_id] = best
+
+            return best
 
         except Exception as e:
             rospy.logwarn_throttle(1.0, f"[SAM2] seg failed: {e}")
@@ -1506,24 +1671,15 @@ class FoundationPosePipelineTracker:
         return t, (float(qx),float(qy),float(qz),float(qw))
 
     def broadcast_transform_and_pose(self, T: np.ndarray, which: str, parent: str):
-        """同時送 TF + 對應 Pose topic"""
-        if which.lower() == "bunch":
-            child = self.bunch_name
-            pub   = self.pose_pub_bunch
-        else:
-            child = self.stem_name
-            pub   = self.pose_pub_stem
+        """Broadcast TF only.
 
-        # TF
-        t = (float(T[0,3]), float(T[1,3]), float(T[2,3]))
-        qx,qy,qz,qw = tf.transformations.quaternion_from_matrix(T)
-        self.tf_broadcaster.sendTransform(t, (qx,qy,qz,qw), rospy.Time.now(), child, parent)
+        NOTE: Pose is now carried in Confidence.msg and published on a unified topic.
+        """
+        child = self.bunch_name if which.lower() == "bunch" else self.stem_name
 
-        # Pose
-        msg = Pose()
-        msg.position.x, msg.position.y, msg.position.z = t
-        msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w = (qx,qy,qz,qw)
-        pub.publish(msg)
+        t = (float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
+        qx, qy, qz, qw = tf.transformations.quaternion_from_matrix(T)
+        self.tf_broadcaster.sendTransform(t, (qx, qy, qz, qw), rospy.Time.now(), child, parent)
 
     def imageCallback(self, msg: Image):
         try:
@@ -1561,21 +1717,26 @@ class FoundationPosePipelineTracker:
         self.got_depth = True
         self.depth_size = (self.depth_vis.shape[1], self.depth_vis.shape[0])
 
-    def bunchdetectionCallback(self, msg: Detection):
-        mode = (msg.det_select_mode or "").strip().lower()
-        if mode not in ("score","middle","nearest_depth"):
-            rospy.logwarn_throttle(1.0, f"[BUNCH] invalid det_select_mode={mode}, fallback score")
-            mode = "score"
-        self.bunch_det_select_mode = mode
-        self.bunch_ready_received.detection_allowed = msg.detection_allowed
+    def detectionCallback(self, msg: Detection):
+        """Unified detection gating callback.
 
-    def stemdetectionCallback(self, msg: Detection):
-        mode = (msg.det_select_mode or "").strip().lower()
-        if mode not in ("score","middle"):
-            rospy.logwarn_throttle(1.0, f"[STEM] invalid det_select_mode={mode}, fallback score")
+        - detection_allowed: whether we are allowed to run YOLO/pose pipeline
+        - det_select_mode: affects BUNCH only. When already in STEM, occlusion check is skipped.
+        """
+        mode = (getattr(msg, "det_select_mode", "") or "").strip().lower()
+        if mode not in ("score", "middle", "nearest_depth"):
+            rospy.logwarn_throttle(1.0, f"[DETECTION] invalid det_select_mode={mode}, fallback score")
             mode = "score"
-        self.stem_ready_received.detection_allowed = msg.detection_allowed
-        self.stem_det_select_mode = mode
+        self.det_select_mode_current = mode
+        self.ready_received.detection_allowed = bool(getattr(msg, "detection_allowed", False))
+    
+    def harvestDoneCallback(self, msg: Bool):
+        if not bool(msg.data):
+            return
+
+        rospy.logwarn("[HARVEST_DONE] received True -> hard reset to BUNCH")
+        self._reset_all_to_bunch()
+        self._publish_zero_current(used_sam=False)
 
     def _tag(self, which: str) -> str:
         return "BUNCH" if which.lower() == "bunch" else "STEM"
@@ -1589,11 +1750,10 @@ class FoundationPosePipelineTracker:
     def _state(self, which: str, used_sam: bool = False) -> str:
         part = self._tag(which)
 
-        allowed = (self.bunch_ready_received.detection_allowed if which.lower()=="bunch"
-                else self.stem_ready_received.detection_allowed)
+        allowed = bool(getattr(self.ready_received, "detection_allowed", False))
 
         if self.yolo_start_mode == "wait" and (not allowed):
-            return f"{part}:DETECTION_DISABLED"
+            return f"{part}:PAUSED"
 
         if not (self.got_depth and self.got_rgb and self.K is not None and hasattr(self, "depth_m")):
             return f"{part}:INITIALIZING"
@@ -1620,25 +1780,40 @@ class FoundationPosePipelineTracker:
                 return f"{part}:SAM"
             return f"{part}:STABLE"
 
-    def confidence_publish(self, which: str, score: float, detection: bool, used_sam: bool = False):
+    def confidence_publish(self, which: str, iou: float, detection: bool, used_sam: bool = False):
+        """Publish unified Confidence.msg for either bunch or stem.
+
+        Confidence.msg fields used:
+        - stamp
+        - frame_id: self.bunch_name or self.stem_name
+        - object_IoU
+        - object_detection
+        - state
+        - position / orientation: from current estimated pose (if available)
+        """
         conf_msg = Confidence()
         conf_msg.stamp = rospy.Time.now()
         conf_msg.state = self._state(which, used_sam=used_sam)
-        if which.lower() == "bunch":
-            conf_msg.frame_id = self.bunch_name
-            conf_msg.object_IoU = float(score)
-            conf_msg.object_detection = bool(detection)
-            self.conf_pub_bunch.publish(conf_msg)
-        else:
-            conf_msg.frame_id = self.stem_name
-            conf_msg.object_IoU = float(score)
-            conf_msg.object_detection = bool(detection)
-            self.conf_pub_stem.publish(conf_msg)
+        conf_msg.frame_id = self.bunch_name if which.lower() == "bunch" else self.stem_name
+        conf_msg.object_IoU = float(iou)
+        conf_msg.object_detection = bool(detection)
 
-    def _publish_zero_both(self, used_sam: bool = False):
-        """Publish 0 confidence for both bunch and stem."""
-        self.confidence_publish("bunch", 0.0, False, used_sam=used_sam)
-        self.confidence_publish("stem",  0.0, False, used_sam=used_sam)
+        T = self.pose_bunch if which.lower() == "bunch" else self.pose_stem
+        if T is not None:
+            t = (float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
+            qx, qy, qz, qw = tf.transformations.quaternion_from_matrix(T)
+        else:
+            t = (0.0, 0.0, 0.0)
+            qx, qy, qz, qw = (0.0, 0.0, 0.0, 1.0)
+
+        conf_msg.position = Point(x=t[0], y=t[1], z=t[2])
+        conf_msg.orientation = Quaternion(x=qx, y=qy, z=qz, w=qw)
+        self.conf_pub.publish(conf_msg)
+
+    def _publish_zero_current(self, used_sam: bool = False):
+        """Publish a single zero-confidence message on the unified topic."""
+        which = "stem" if self.mode == "STEM" else "bunch"
+        self.confidence_publish(which, 0.0, False, used_sam=used_sam)
 
     def _reset_pipeline_state(self):
         """Reset the whole pipeline to initial waiting state (same as your duplicated logic)."""
@@ -1646,6 +1821,7 @@ class FoundationPosePipelineTracker:
         self.pose_bunch = None
         self.pose_stem  = None
         self._hi_cnt = 0
+        self._stem_lock = False
 
         # IoU / counters
         self.iou_bad_count = 0
@@ -1660,30 +1836,49 @@ class FoundationPosePipelineTracker:
         # Force re-detect flag
         self._force_bunch_detect = False
 
-    def _handle_detection_disabled_and_wait(self, used_sam: bool = False):
-        """
-        Unified 'DETECTION DISABLED' handling:
-        - reset pipeline state
-        - publish zero both
-        - show text
-        - pump windows
-        - return True means caller should continue
-        """
+    def _reset_all_to_bunch(self):
+        """Hard reset: clear all cached data and return to BUNCH."""
         self._reset_pipeline_state()
-        self._publish_zero_both(used_sam=used_sam)
 
+        # Clear YOLO debounce buffers
+        self._yolo_delay_left_bunch = 0
+        self._yolo_delay_left_stem = 0
+        self._yolo_delay_bbox_bunch = None
+        self._yolo_delay_bbox_stem = None
+
+        # Clear SAM2 mask memory
+        try:
+            self.sam2_prev_masks.clear()
+        except Exception:
+            self.sam2_prev_masks = {}
+
+        # Clear postproc debounce
+        self._post_pending = False
+        self._post_fail_time = None
+
+        # Clear transient windows text
+        self._last_yolo_text = ""
+
+        # Clear scheduling guards
+        self._registering_until = 0
+        self._reinit_until = 0
+    
+    def _handle_detection_paused(self):
+        """Pause: do NOT reset any state. Just hold and publish zero(optional)."""
         if self.color is not None:
             vis_rgb = self.color.copy()
-            cv2.putText(vis_rgb, "DETECTION DISABLED", (20, 40),
+            cv2.putText(vis_rgb, "PAUSED (detection_allowed=FALSE)", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
         else:
             vis_rgb = None
+
+        # 你要不要 publish 0：我建議要（讓上游知道暫停）
+        self._publish_zero_current(used_sam=False)
 
         self.pump_windows(
             vis_rgb if self.show_rgb_win else None,
             self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None
         )
-        return True
 
     def pick_nearest_from_dets(self, xyxy, sc, cl, target_xyxy, cls_id):
         """
@@ -1778,19 +1973,29 @@ class FoundationPosePipelineTracker:
             if not (self.got_depth and self.got_rgb and self.K is not None and hasattr(self, "depth_m")):
                 self.pump_windows(self.color if self.got_rgb else None,
                                 self.depth_vis if self.got_depth else None)
-                rospy.sleep(0.01)
+                rospy.sleep(0.1)
                 continue
 
-            # 2) wait 模式 gating：依照「當前 mode」檢查對應 allowed
-            if self.yolo_start_mode == "wait":
-                if self.mode == "BUNCH" and (not self.bunch_ready_received.detection_allowed):
-                    self._handle_detection_disabled_and_wait(used_sam=False)
-                    continue
-                if self.mode == "STEM" and (not self.stem_ready_received.detection_allowed):
-                    self._handle_detection_disabled_and_wait(used_sam=False)
+            # 2) STEM lock gating：一旦切到 STEM 就永遠只跑 STEM，直到 external reset / harvest done
+            allowed = bool(getattr(self.ready_received, "detection_allowed", False))
+            if self._stem_lock:
+                if self.yolo_start_mode == "wait" and (not allowed):
+                    # pause: keep stem lock + keep mode, do NOT reset
+                    self.mode = "STEM"
+                    self._handle_detection_paused()
+                    rospy.sleep(0.05)
                     continue
 
-            # 3) postprocess debounce：倒數中暫停
+                # still allowed
+                self.mode = "STEM"
+
+            # 3) wait 模式 gating：統一用同一個 allow
+            if self.yolo_start_mode == "wait" and (not allowed):
+                self._handle_detection_paused()
+                rospy.sleep(0.05)
+                continue
+
+            # 4) postprocess debounce：倒數中暫停
             if getattr(self, "_post_pending", False):
                 now = rospy.Time.now()
                 start_t = self._post_fail_time or now
@@ -1803,7 +2008,7 @@ class FoundationPosePipelineTracker:
 
                 self.pump_windows(vis_rgb if self.show_rgb_win else None,
                                 self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
-                self._publish_zero_both(used_sam=used_sam)
+                self._publish_zero_current(used_sam=used_sam)
 
                 if elapsed >= float(self.pp_retry_delay_sec):
                     rospy.logwarn("[POST] Debounce timeout reached. Reinit now.")
@@ -1819,7 +2024,7 @@ class FoundationPosePipelineTracker:
             # ---- 進入本幀處理 ----
             self.frame_count += 1
 
-            # 4) 本幀只跑一次 YOLO
+            # 5) 本幀只跑一次 YOLO
             xyxy_all, sc_all, cl_all = self.yolo_det_all(
                 self.detector, self.color, imgsz=self.det_imgsz, conf=self.det_conf
             )
@@ -1828,7 +2033,7 @@ class FoundationPosePipelineTracker:
                 xyxy_all, sc_all, cl_all,
                 img_shape=self.color.shape,
                 prefer_cls=self.cls_bunch,
-                select_mode=getattr(self, "bunch_det_select_mode", self.det_select_mode),
+                select_mode=getattr(self, "det_select_mode_current", self.det_select_mode),
                 conf_th=self.det_conf
             )
 
@@ -1846,7 +2051,7 @@ class FoundationPosePipelineTracker:
 
                     if bunch_xyxy is None:
                         self.pump_windows(vis_bgr, self.depth_vis if self.got_depth else None)
-                        self._publish_zero_both(used_sam=used_sam)
+                        self._publish_zero_current(used_sam=used_sam)
                         continue
 
                     # 顯示倒數文字，不要register
@@ -1855,7 +2060,7 @@ class FoundationPosePipelineTracker:
                         cv2.putText(vis_bgr, f"YOLO detected. Delay register... ({left} frames left)",
                                     (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2, cv2.LINE_AA)
                         self.pump_windows(vis_bgr, self.depth_vis if self.got_depth else None)
-                        self._publish_zero_both(used_sam=used_sam)
+                        self._publish_zero_current(used_sam=used_sam)
                         continue
 
                     m = self.rect_to_mask(self.depth_m, self.clip_xyxy(bb_use, *self.rgb_size), expand=self.roi_expand)
@@ -1864,7 +2069,7 @@ class FoundationPosePipelineTracker:
                         ob_mask=m, iteration=self.est_refine_iter
                     )
                     if self.pose_bunch is None:
-                        self._publish_zero_both(used_sam=used_sam)
+                        self._publish_zero_current(used_sam=used_sam)
                         continue
 
                     self._set_registering(2)
@@ -1890,7 +2095,7 @@ class FoundationPosePipelineTracker:
                         tag="BUNCH"
                     )
                     iou_for_bar = 0.0 if iou_val is None else float(iou_val)
-                    occ = 1.0 - iou_for_bar  # 只是給你後面變數不爆炸；但 middle 不會用到 occ
+                    occ = None
                 else:
                     occ, iou_for_bar, used_sam = self.compute_occ_and_iou("bunch", xyxy_all, sc_all, cl_all)
 
@@ -1898,7 +2103,7 @@ class FoundationPosePipelineTracker:
                 if self.pose_bunch is not None:
                     center_pose = self.pose_bunch @ np.linalg.inv(self.to_origin_bunch)
                     if self.maybe_regrab_roi_by_iou_from_dets("BUNCH", center_pose, xyxy_all, sc_all, cl_all):
-                        self._publish_zero_both(used_sam=used_sam)
+                        self._publish_zero_current(used_sam=used_sam)
                         continue
 
                 # (E) hi_cnt logic (same as yours)
@@ -1907,15 +2112,19 @@ class FoundationPosePipelineTracker:
                     rospy.loginfo_throttle(1.0, f"[BUNCH] det_select_mode=middle iou={iou_for_bar:.2f} (skip occlusion)")
                 else:
                     if used_sam:
-                        rospy.loginfo_throttle(1.0, f"[BUNCH] occ={occ:.2f} warmup=Y iou={iou_for_bar:.2f}")
-                        if occ >= self.policy_occ_hi:
+                        # 只在 SAM warmup 期間才做遮蔽判斷 / 切 STEM
+                        rospy.loginfo_throttle(1.0, f"[BUNCH] occ={float(occ):.2f} warmup=Y iou={iou_for_bar:.2f}")
+                        if occ is not None and occ >= self.policy_occ_hi:
                             self._hi_cnt += 1
                     else:
-                        rospy.loginfo_throttle(1.0, f"[BUNCH] iou={iou_for_bar:.2f} warmup=N")
+                        # warmup 結束後：不算 occ、不使用 occ、也不切 stem
+                        self._hi_cnt = 0
+                        rospy.loginfo_throttle(1.0, f"[BUNCH] warmup=N iou={iou_for_bar:.2f} (skip occ & stem-switch)")
+
                     rospy.loginfo_throttle(1.0, f"[BUNCH] hi_cnt={self._hi_cnt}")
 
-                    # (F) switch to STEM when occlusion high for N frames
-                    if self._hi_cnt >= self.policy_hi_pat:
+                    # (F) switch to STEM only during warmup (used_sam)
+                    if used_sam and self._hi_cnt >= self.policy_hi_pat:
                         stem_xyxy, _ = self.pick_nearest_from_dets(xyxy_all, sc_all, cl_all, bunch_xyxy, self.cls_stem)
                         if stem_xyxy is not None:
                             m = self.rect_to_mask(self.depth_m, self.clip_xyxy(stem_xyxy, *self.rgb_size), expand=self.roi_expand)
@@ -1925,8 +2134,15 @@ class FoundationPosePipelineTracker:
                             )
                             if self.pose_stem is not None:
                                 self.mode = "STEM"
+                                self._stem_lock = True
+                                self.pose_bunch = None
+                                self.sam_warmup_left_bunch = 0
+                                try:
+                                    self.sam2_prev_masks.pop(self.sam2_obj_ids["bunch"], None)
+                                except Exception:
+                                    pass
                                 self._hi_cnt = 0
-                                self._publish_zero_both(used_sam=used_sam)
+                                self._publish_zero_current(used_sam=used_sam)
                                 self.pump_windows(vis_bgr if self.show_rgb_win else None,
                                                 self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
                                 continue
@@ -1938,7 +2154,7 @@ class FoundationPosePipelineTracker:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
                     self.pump_windows(vis_bgr if self.show_rgb_win else None,
                                     self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
-                    self._publish_zero_both(used_sam=used_sam)
+                    self._publish_zero_current(used_sam=used_sam)
                     continue
 
                 # (H) publish TF/pose + visualize (bunch)
@@ -1965,7 +2181,7 @@ class FoundationPosePipelineTracker:
                 if self.pose_stem is None:
                     if bunch_xyxy is None:
                         self.pump_windows(vis_bgr, self.depth_vis if self.got_depth else None)
-                        self._publish_zero_both(used_sam=used_sam)
+                        self._publish_zero_current(used_sam=used_sam)
                         continue
 
                     stem_xyxy, _ = self.pick_nearest_from_dets(xyxy_all, sc_all, cl_all, bunch_xyxy, self.cls_stem)
@@ -1973,7 +2189,7 @@ class FoundationPosePipelineTracker:
                         # stem 沒偵測到 → reset delay
                         self._yolo_delay_update("stem", None)
                         self.pump_windows(vis_bgr, self.depth_vis if self.got_depth else None)
-                        self._publish_zero_both(used_sam=used_sam)
+                        self._publish_zero_current(used_sam=used_sam)
                         continue
                     # stem bbox delay
                     ready, bb_use = self._yolo_delay_update("stem", stem_xyxy)
@@ -1982,7 +2198,7 @@ class FoundationPosePipelineTracker:
                         cv2.putText(vis_bgr, f"STEM YOLO detected. Delay register... ({left} frames left)",
                                     (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2, cv2.LINE_AA)
                         self.pump_windows(vis_bgr, self.depth_vis if self.got_depth else None)
-                        self._publish_zero_both(used_sam=used_sam)
+                        self._publish_zero_current(used_sam=used_sam)
                         continue
 
                     m = self.rect_to_mask(self.depth_m, self.clip_xyxy(bb_use, *self.rgb_size), expand=self.roi_expand)
@@ -1991,7 +2207,7 @@ class FoundationPosePipelineTracker:
                         ob_mask=m, iteration=self.est_refine_iter
                     )
                     if self.pose_stem is None:
-                        self._publish_zero_both(used_sam=used_sam)
+                        self._publish_zero_current(used_sam=used_sam)
                         continue
 
                     self._set_registering(2)
@@ -2036,14 +2252,14 @@ class FoundationPosePipelineTracker:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
                     self.pump_windows(vis_bgr if self.show_rgb_win else None,
                                     self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
-                    self._publish_zero_both(used_sam=used_sam)
+                    self._publish_zero_current(used_sam=used_sam)
                     continue
 
                 # (F) IoU-based regrab ROI (stem)
                 if self.pose_stem is not None:
                     center_pose = self.pose_stem @ np.linalg.inv(self.to_origin_stem)
                     if self.maybe_regrab_roi_by_iou_from_dets("STEM", center_pose, xyxy_all, sc_all, cl_all):
-                        self._publish_zero_both(used_sam=used_sam)
+                        self._publish_zero_current(used_sam=used_sam)
                         continue
 
                 # (G) publish TF/pose + visualize (stem)
