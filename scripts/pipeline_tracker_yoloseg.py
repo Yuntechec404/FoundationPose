@@ -17,6 +17,7 @@ from cv_bridge import CvBridge
 from forklift_msg.msg import Confidence, Detection
 from std_msgs.msg import Bool
 from datetime import datetime
+import torchvision.transforms.functional as F
 
 import tf
 
@@ -31,6 +32,17 @@ for p in EXTRA_PATHS:
     if p not in sys.path:
         sys.path.append(p)
 
+# --- 載入 Cutie VOS 模組 ---
+CUTIE_PATH = "/home/user/Cutie" 
+if CUTIE_PATH not in sys.path:
+    sys.path.append(CUTIE_PATH)
+try:
+    from cutie.inference.inference_core import InferenceCore
+    from cutie.utils.get_default_model import get_default_model
+    CUTIE_AVAILABLE = True
+except ImportError:
+    CUTIE_AVAILABLE = False
+    print("[WARNING] Cutie module not found. Stem Servoing will fallback or fail.")
 
 os.environ.setdefault("ULTRALYTICS_NO_INSTALL", "1")
 
@@ -78,6 +90,19 @@ class FoundationPosePipelineTracker:
         self._stem_lock = False
         self._pause_hold = False
         self._last_allowed = False
+
+        # --- Cutie 初始化 ---
+        if CUTIE_AVAILABLE:
+            rospy.loginfo("[Cutie] Loading weights...")
+            self.cutie_net = get_default_model()
+            self.cutie_net.eval().cuda()
+            self.cutie_processor = InferenceCore(self.cutie_net, cfg=self.cutie_net.cfg)
+            self.cutie_processor.max_internal_size = 640 # 限制解析度防斷電
+
+        self.bunch_cutie_state = "CRUISING"  # CRUISING / SERVOING
+        self.stem_cutie_state = "CRUISING"   # CRUISING / SERVOING
+        self.erode_iterations = 2             # 腐蝕次數(防多割)
+        self.erode_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         
         # --- 葉莖持續追蹤 (Tracking) 狀態 ---        
         self.last_stem_3d_pos = None  # np.array([x, y, z]) 紀錄最後一次算出的葉莖相機座標
@@ -256,7 +281,8 @@ class FoundationPosePipelineTracker:
         self.stem_depth_max = float(gp("postproc/stem/stem_depth_max", 3.0))
         self.stem_assumed_radius = float(gp("postproc/stem/stem_assumed_radius", 0.02))
         self.tracker_type = gp("tracker_type", "bytetrack.yaml")
-        self.max_dist_px = int(gp("postproc/stem/max_dist_px", 0))
+        self.stem_max_jump_m = float(gp("postproc/stem/max_jump_m", 0.06)) 
+        self.stem_ema_alpha = float(gp("postproc/stem/ema_alpha", 0.6))
 
         # 打包尺寸設定
         self.cfg_bunch = dict(
@@ -633,7 +659,6 @@ class FoundationPosePipelineTracker:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
             self.pump_windows(vis if self.show_rgb_win else None,
                             self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
-            self._set_reinit(3)
             return True
 
         self.pose_bunch = None
@@ -642,7 +667,6 @@ class FoundationPosePipelineTracker:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
         self.pump_windows(vis if self.show_rgb_win else None,
                         self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
-        self._set_reinit(3)
         return True
 
     def iou_xyxy(self, a, b):
@@ -973,88 +997,52 @@ class FoundationPosePipelineTracker:
         這能濾除 Bounding Box 中不屬於目標物體的背景部分。
         """
         H, W = bgr.shape[:2]
-        if xyxy is None:
-            return np.zeros((H, W), dtype=bool)
-
+        if xyxy is None: return np.zeros((H, W), dtype=bool)
         x1, y1, x2, y2 = xyxy.astype(np.int32)
         w, h = max(1, x2 - x1), max(1, y2 - y1)
-        cx1 = max(0, int(x1 - w * self.roi_expand))
-        cy1 = max(0, int(y1 - h * self.roi_expand))
-        cx2 = min(W - 1, int(x2 + w * self.roi_expand))
-        cy2 = min(H - 1, int(y2 + h * self.roi_expand))
+        cx1 = max(0, int(x1 - w * self.roi_expand)); cy1 = max(0, int(y1 - h * self.roi_expand))
+        cx2 = min(W - 1, int(x2 + w * self.roi_expand)); cy2 = min(H - 1, int(y2 + h * self.roi_expand))
 
-        def _bbox_mask():
-            return self.rect_to_mask(bgr, xyxy, expand=self.roi_expand)
-
-        if self.seg_detector is None:
-            return _bbox_mask()
+        if self.seg_detector is None: return self.rect_to_mask(bgr, xyxy, expand=self.roi_expand)
 
         try:
-            pred_kwargs = {
-                "source": bgr,
-                "imgsz": self.seg_imgsz,
-                "conf": self.det_conf,
-                "iou": self.iou_thresh,
-                "device": self.det_device,
-                "verbose": False
-            }
-            if target_cls is not None:
-                pred_kwargs["classes"] = [int(target_cls)]
-
+            pred_kwargs = {"source": bgr, "imgsz": self.seg_imgsz, "conf": self.det_conf, "device": self.det_device, "verbose": False}
+            if target_cls is not None: pred_kwargs["classes"] = [int(target_cls)]
             r = self.seg_detector.predict(**pred_kwargs)[0]
+            if r.masks is None or len(r.masks.xy) == 0: return self.rect_to_mask(bgr, xyxy, expand=self.roi_expand)
 
-            if r.masks is None or len(r.masks.xy) == 0:
-                return _bbox_mask()
-
-            best_mask = None
-            best_score = -1.0
-
+            best_mask, best_score = None, -1.0
             for poly in r.masks.xy:
                 if len(poly) < 3: continue
-                    
                 mm_bin = np.zeros((H, W), dtype=np.uint8)
                 cv2.fillPoly(mm_bin, [np.int32(poly)], 1)
                 mm_bin = mm_bin.astype(bool)
-                
                 inter = mm_bin[cy1:cy2, cx1:cx2].sum()
-                area = mm_bin.sum() + 1e-6
-                score = float(inter / area)
-                
+                score = float(inter / (mm_bin.sum() + 1e-6))
                 if score > best_score:
                     best_score = score
                     best_mask = mm_bin
-
-            if best_mask is None or best_score < 0.1:
-                return _bbox_mask()
-
+            if best_mask is None or best_score < 0.1: return self.rect_to_mask(bgr, xyxy, expand=self.roi_expand)
             return best_mask
-
         except Exception as e:
-            rospy.logwarn_throttle(1.0, f"[YOLO-SEG] seg failed: {e}")
-            return _bbox_mask()
+            return self.rect_to_mask(bgr, xyxy, expand=self.roi_expand)
 
     # =========================
     # stem YOLO-Seg
     # =========================
     def calculate_direct_root_pose(self, depth_m, mask_bool):
         """
-        高斯濾波消除深度圖雜訊，並結合 YOLO-Seg 產生的葉莖 Mask，
-        找出最下方(y軸最大)的多個點，取深度中位數，計算出葉莖底部的實際 3D 空間座標。
+        從深度圖中提取 Mask 區域內的有效點，利用中位數抗噪。
         """
-        filtered_depth = depth_m.copy()
-        
-        max_depth_val = np.max(filtered_depth)
-        filtered_depth[filtered_depth == 0] = max_depth_val
-        
-        filtered_depth = cv2.GaussianBlur(filtered_depth, (3, 3), 0)
-
         v, u = np.where(mask_bool > 0)
         if len(v) == 0:
             return None, None, None, "No Mask Points"
             
-        z_raw = filtered_depth[v, u]
-        valid_mask = (z_raw > self.stem_depth_min) & (z_raw < self.stem_depth_max)
+        # 1. 只提取有 Mask 像素的深度值
+        z_raw = depth_m[v, u]
         
+        # 2. 過濾無效深度 (太近、太遠、或 0)
+        valid_mask = (z_raw > self.stem_depth_min) & (z_raw < self.stem_depth_max)
         if np.sum(valid_mask) < 10: 
             return None, None, None, "No valid depth in mask"
             
@@ -1062,33 +1050,27 @@ class FoundationPosePipelineTracker:
         v_valid = v[valid_mask]
         z_valid = z_raw[valid_mask]
 
+        # 3. 找最下方 (V 座標最大) 的 Top K 個點
         sorted_indices = np.argsort(v_valid)[::-1]
         top_k = min(20, len(sorted_indices))
         bottom_indices = sorted_indices[:top_k]
         
-        u_bottom_group = u_valid[bottom_indices]
-        v_bottom_group = v_valid[bottom_indices]
-        z_bottom_group = z_valid[bottom_indices]
+        target_u = int(np.median(u_valid[bottom_indices]))
+        target_v = int(np.median(v_valid[bottom_indices]))
+        target_z = float(np.median(z_valid[bottom_indices])) # 中位數天生抗噪，不需全圖高斯模糊
         
-        target_u = int(np.median(u_bottom_group))
-        target_v = int(np.median(v_bottom_group))
-        target_z = float(np.median(z_bottom_group))
-        
-        fx = self.K[0, 0]
-        fy = self.K[1, 1]
-        cx = self.K[0, 2]
-        cy = self.K[1, 2]
+        # 4. 座標轉換
+        fx, fy = self.K[0, 0], self.K[1, 1]
+        cx, cy = self.K[0, 2], self.K[1, 2]
         
         x_surface = (target_u - cx) * target_z / fx
         y_surface = (target_v - cy) * target_z / fy
-        
         target_z_center = target_z + self.stem_assumed_radius
         
         center_3d = np.array([x_surface, y_surface, target_z_center])
         projected_2d = (target_u, target_v)
-        quat = [0.0, 0.0, 0.0, 1.0]
-
-        return center_3d, quat, projected_2d, "OK"
+        
+        return center_3d, [0.0, 0.0, 0.0, 1.0], projected_2d, "OK"
 
     def cmd_vel_callback(self, msg: Twist):
         """讀取 ROS cmd_vel Topic (車體速度)，用於預測葉莖在畫面中的位移。"""
@@ -1156,8 +1138,8 @@ class FoundationPosePipelineTracker:
 
         return np.array([X_c_new, Y_c_new, Z_c_new])
 
-    def pick_nearest_to_2d_point(self, xyxy, sc, cl, ids, target_2d, cls_id, max_dist_px=None):
-        """尋找畫面上與目標 2D 預測座標點距離最近的 YOLO Bounding Box。"""
+    def pick_nearest_to_2d_point(self, xyxy, sc, cl, ids, target_2d, cls_id):
+        """尋找畫面上與目標 2D 預測座標點距離最近的 YOLO Bounding Box。不設像素上限，交由後續 3D 深度防呆處理。"""
         if xyxy is None or len(xyxy) == 0 or target_2d is None:
             return None, None, -1
         idx = np.where(cl == int(cls_id))[0]
@@ -1176,12 +1158,7 @@ class FoundationPosePipelineTracker:
 
         if bid < 0:
             return None, None, -1
-            
-        # 如果有設定最大距離限制，且最近的目標超過這個距離
-        if max_dist_px is not None and best_dist > (max_dist_px ** 2):
-            rospy.logwarn_throttle(1.0, f"[stem] Nearest stem too far ({best_dist**0.5:.1f}px > {max_dist_px}px), waiting for next frame...")
-            return None, None, -1
-            
+        
         return xyxy[bid], float(sc[bid]), int(ids[bid])
 
     # =============== GUI ===============
@@ -1424,34 +1401,20 @@ class FoundationPosePipelineTracker:
         """產生當前模式字串標籤。"""
         return "bunch" if which.lower() == "bunch" else "stem"
 
-    def _set_registering(self, n_frames: int = 2):
-        """設定延遲計數：將在 n 幀內保持 '註冊中' 的狀態。"""
-        self._registering_until = self.frame_count + max(1, int(n_frames))
-
-    def _set_reinit(self, n_frames: int = 3):
-        """設定延遲計數：將在 n 幀內保持 '重新初始化' 的狀態。"""
-        self._reinit_until = self.frame_count + max(1, int(n_frames))
-
     def _state(self, which: str, used_seg: bool = False) -> str:
         """建立自定義的系統當前狀態字串。"""
         part = self._tag(which)
         allowed = bool(getattr(self.ready_received, "detection_allowed", False))
 
+        # 1. 系統暫停
         if self.yolo_start_mode == "wait" and (not allowed):
             return f"{part}:PAUSED"
 
+        # 2. 相機或影像資料尚未準備好
         if not (self.got_depth and self.got_rgb and self.K is not None and hasattr(self, "depth_m")):
             return f"{part}:INITIALIZING"
 
-        if getattr(self, "_post_pending", False):
-            return f"{part}:POSTPROCESS"
-
-        if getattr(self, "_reinit_until", 0) >= self.frame_count:
-            return f"{part}:REINITIALIZING"
-
-        if getattr(self, "_registering_until", 0) >= self.frame_count:
-            return f"{part}:REGISTERING"
-
+        # 3. 根據目標姿態判定狀態
         if which.lower() == "bunch":
             if self.pose_bunch is None:
                 return f"{part}:YOLO"
@@ -1460,7 +1423,7 @@ class FoundationPosePipelineTracker:
             return f"{part}:STABLE"
         else:
             if self.pose_stem is None:
-                return f"{part}:YOLO"
+                return f"{part}:YOLOSEG"
             return f"{part}:STABLE"
 
     def confidence_publish(self, which: str, iou: float, detection: bool, used_seg: bool = False):
@@ -1507,6 +1470,13 @@ class FoundationPosePipelineTracker:
         self.last_stem_time = None
 
         self._force_bunch_detect = False
+        self.last_bunch_3d_pos = None
+
+        # 重置 Cutie 多目標
+        self.bunch_cutie_state = "CRUISING"
+        self.stem_cutie_state = "CRUISING"
+        if self.cutie_processor is not None:
+            self.cutie_processor.clear_memory()
 
     def _reset_all_to_bunch(self):
         """硬重置：除了清除姿態，也將延遲過濾和畫面文字一併清空。"""
@@ -1608,274 +1578,253 @@ class FoundationPosePipelineTracker:
             used_seg = False
             
             if not (self.got_depth and self.got_rgb and self.K is not None and hasattr(self, "depth_m")):
-                self.pump_windows(self.color if self.got_rgb else None,
-                                self.depth_vis if self.got_depth else None)
-                rospy.sleep(0.1)
+                self.pump_windows(self.color if self.got_rgb else None, self.depth_vis if self.got_depth else None)
                 continue
 
             allowed = bool(getattr(self.ready_received, "detection_allowed", False))
-            if self._stem_lock:
-                if self.yolo_start_mode == "wait" and (not allowed):
-                    self.mode = "stem"
-                    self._handle_detection_paused()
-                    rospy.sleep(0.05)
-                    continue
-                self.mode = "stem"
-
             if self.yolo_start_mode == "wait" and (not allowed):
                 self._handle_detection_paused()
-                rospy.sleep(0.05)
-                continue
-
-            if getattr(self, "_post_pending", False):
-                now = rospy.Time.now()
-                start_t = self._post_fail_time or now
-                elapsed = (now - start_t).to_sec()
-                remaining = max(0.0, float(self.pp_retry_delay_sec) - elapsed)
-
-                vis_rgb = self.color.copy()
-                cv2.putText(vis_rgb, f"Post-check pending... reinit in {remaining:.1f}s",
-                            (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2, cv2.LINE_AA)
-
-                self.pump_windows(vis_rgb if self.show_rgb_win else None,
-                                self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
-                self._publish_zero_current(used_seg=used_seg)
-
-                if elapsed >= float(self.pp_retry_delay_sec):
-                    rospy.logwarn("[POST] Debounce timeout reached. Reinit now.")
-                    self._set_reinit(3)
-                    self._post_pending = False
-                    self._post_fail_time = None
-                    self.pose_bunch = None
-                    self.pose_stem  = None
-
-                rospy.sleep(0.01)
                 continue
 
             self.frame_count += 1
-            xyxy_all, sc_all, cl_all, ids_all = self.yolo_det_all(
-                self.detector, self.color, imgsz=self.det_imgsz, conf=self.det_conf
-            )
-
-            bunch_xyxy, bunch_conf = self.select_yolo_bbox(
-                xyxy_all, sc_all, cl_all,
-                img_shape=self.color.shape,
-                prefer_cls=self.cls_bunch,
-                select_mode=getattr(self, "det_select_mode_current", self.det_select_mode),
-                conf_th=self.det_conf
-            )
-
+            now = rospy.Time.now()
+            
+            img_rgb = cv2.cvtColor(self.color, cv2.COLOR_BGR2RGB)
+            img_tensor = F.to_tensor(img_rgb).unsqueeze(0).cuda().float()
             vis_bgr = self.color.copy()
 
-            # =========================
-            # bunch mode
-            # =========================
-            if self.mode == "bunch":
-                if self.pose_bunch is None:
-                    ready, bb_use = self._yolo_delay_update("bunch", bunch_xyxy)
-                    vis_bgr = self.color.copy()
+            # --- 決定是否需要跑 YOLO ---
+            run_yolo = False
+            if self.bunch_cutie_state == "CRUISING":
+                run_yolo = True
+            elif self.mode == "stem" and self.stem_cutie_state == "CRUISING":
+                run_yolo = True
 
-                    if bunch_xyxy is None:
-                        self.pump_windows(vis_bgr, self.depth_vis if self.got_depth else None)
-                        self._publish_zero_current(used_seg=used_seg)
-                        continue
+            xyxy_all, sc_all, cl_all, ids_all = None, None, None, None
+            if run_yolo:
+                xyxy_all, sc_all, cl_all, ids_all = self.yolo_det_all(self.detector, self.color, imgsz=self.det_imgsz, conf=self.det_conf)
 
-                    left = int(getattr(self, "_yolo_delay_left_bunch", 0))
-                    if not ready:
-                        cv2.putText(vis_bgr, f"YOLO detected. Delay register... ({left} frames left)",
-                                    (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2, cv2.LINE_AA)
-                        self.pump_windows(vis_bgr, self.depth_vis if self.got_depth else None)
-                        self._publish_zero_current(used_seg=used_seg)
-                        continue
+            # 準備提供給 Cutie 初始化的陣列 (0=背景, 1=果串, 2=葉莖)
+            cutie_init_mask = np.zeros((self.rgb_size[1], self.rgb_size[0]), dtype=np.uint8)
+            cutie_init_objs = []
 
-                    m = self.rect_to_mask(self.depth_m, self.clip_xyxy(bb_use, *self.rgb_size), expand=self.roi_expand)
-                    self.pose_bunch = self.est_bunch.register(
-                        K=self.K, rgb=self.color, depth=self.depth_m,
-                        ob_mask=m, iteration=self.est_refine_iter
-                    )
-                    if self.pose_bunch is None:
-                        self._publish_zero_current(used_seg=used_seg)
-                        continue
-
-                    self._set_registering(2)
-                    if not self._bunch_skip_occlusion():
-                        self.seg_warmup_left_bunch = int(self.occ_seg_warmup_n)
-                    else:
-                        self.seg_warmup_left_bunch = 0
-
-                self.pose_bunch = self.est_bunch.track_one(
-                    rgb=self.color, depth=self.depth_m, K=self.K, iteration=self.track_refine_iter
+            # ==========================================
+            # 1. BUNCH CRUISING (尋找果串)
+            # ==========================================
+            if self.bunch_cutie_state == "CRUISING":
+                bunch_xyxy, bunch_conf = self.select_yolo_bbox(
+                    xyxy_all, sc_all, cl_all, img_shape=self.color.shape,
+                    prefer_cls=self.cls_bunch, select_mode=self.det_select_mode_current, conf_th=self.det_conf
                 )
-
-                if self._bunch_skip_occlusion():
-                    used_seg = False
-                    self.seg_warmup_left_bunch = 0  
-                    center_pose = self.pose_bunch @ np.linalg.inv(self.to_origin_bunch)
-                    iou_val, _ = self.iou_vs_projection_for_class_from_dets(
-                        self.color, self.K, center_pose, self.bbox_bunch,
-                        prefer_cls=self.cls_bunch,
-                        xyxy_all=xyxy_all, sc_all=sc_all, cl_all=cl_all,
-                        tag="bunch"
-                    )
-                    iou_for_bar = 0.0 if iou_val is None else float(iou_val)
-                    occ = None
+                ready, bb_use = self._yolo_delay_update(bunch_xyxy)
+                
+                if not ready:
+                    if bunch_xyxy is not None:
+                        cv2.putText(vis_bgr, f"YOLO detected. Delay... ({self._yolo_delay_left_bunch} frames left)",
+                                    (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+                    self._publish_zero_current(used_seg=False)
                 else:
-                    occ, iou_for_bar, used_seg = self.compute_occ_and_iou("bunch", xyxy_all, sc_all, cl_all)
+                    # 取得果串 Mask 並寫入 Cutie 初始化陣列
+                    used_mask = self.seg_mask_from_yolo_seg(self.color, bb_use, target_cls=self.cls_bunch)
+                    if used_mask.sum() > 50:
+                        rospy.loginfo("[Hand-off] YOLO -> Cutie Locked BUNCH (ID=1)!")
+                        cutie_init_mask[used_mask] = 1
+                        cutie_init_objs.append(1)
+                        
+                        # 註冊 FoundationPose
+                        self.pose_bunch = self.est_bunch.register(
+                            K=self.K, rgb=self.color, depth=self.depth_m, ob_mask=used_mask.astype(bool), iteration=self.est_refine_iter
+                        )
+                        self.bunch_cutie_state = "SERVOING"
 
-                if self.pose_bunch is not None:
-                    center_pose = self.pose_bunch @ np.linalg.inv(self.to_origin_bunch)
-                    if self.maybe_regrab_roi_by_iou_from_dets("bunch", center_pose, xyxy_all, sc_all, cl_all):
-                        self._publish_zero_current(used_seg=used_seg)
-                        continue
-
-                if self._bunch_skip_occlusion():  
-                    self._hi_cnt = 0
-                    rospy.loginfo_throttle(1.0, f"[bunch] det_select_mode=middle iou={iou_for_bar:.2f} (skip occlusion)")
-                else:
-                    if used_seg:
-                        rospy.loginfo_throttle(1.0, f"[bunch] occ={float(occ):.2f} warmup=Y iou={iou_for_bar:.2f}")
-                        if occ is not None and occ >= self.policy_occ_hi:
-                            self._hi_cnt += 1
-                    else:
-                        self._hi_cnt = 0
-                        rospy.loginfo_throttle(1.0, f"[bunch] warmup=N iou={iou_for_bar:.2f} (skip occ & stem-switch)")
-
-                    rospy.loginfo_throttle(1.0, f"[bunch] hi_cnt={self._hi_cnt}")
-
-                    if used_seg and self._hi_cnt >= self.policy_hi_pat:
-                        stem_xyxy, _, stem_id = self.pick_nearest_from_dets(xyxy_all, sc_all, cl_all, ids_all, bunch_xyxy, self.cls_stem)
-                        if stem_xyxy is not None:
-                            self.mode = "stem"
-                            self._stem_lock = True
-                            self.target_stem_id = stem_id
-                            self.pose_bunch = None
-                            self.seg_warmup_left_bunch = 0
-                            self._hi_cnt = 0
-                            self._publish_zero_current(used_seg=used_seg)
-                            self.pump_windows(vis_bgr if self.show_rgb_win else None,
-                                            self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
-                            continue
-
-                ok_to_publish, pending = self.postprocess_and_maybe_reinit(self.pose_bunch, which="bunch")
-                if pending:
-                    cv2.putText(vis_bgr, "Post-check pending...", (10,90),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
-                    self.pump_windows(vis_bgr if self.show_rgb_win else None,
-                                    self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
-                    self._publish_zero_current(used_seg=used_seg)
-                    continue
-
-                if ok_to_publish and self.pose_bunch is not None:
-                    center_pose = self.pose_bunch @ np.linalg.inv(self.to_origin_bunch)
-                    vis = draw_posed_3d_box(self.K, img=cv2.cvtColor(self.color, cv2.COLOR_BGR2RGB),
-                                            ob_in_cam=center_pose, bbox=self.bbox_bunch)
-                    vis = draw_xyz_axis(vis, ob_in_cam=self.pose_bunch, scale=0.05, K=self.K,
-                                        thickness=3, transparency=0, is_input_rgb=True)
-                    vis_bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
-
-                    parent_frame = self.camera_tf if self.camera_tf else "camera_color_optical_frame"
-                    self.broadcast_transform_and_pose(self.pose_bunch, "bunch", parent_frame)
-                    self.confidence_publish("bunch", iou_for_bar, True, used_seg=used_seg)
-
-            # =========================
-            # stem mode (YOLO Seg 與 Depth 投影)
-            # =========================
-            else:
-                self._hi_cnt = 0
-                used_seg = False  
-                now = rospy.Time.now()
-
+            # ==========================================
+            # 2. STEM CRUISING (尋找葉莖)
+            # ==========================================
+            predicted_2d = None
+            if self.mode == "stem":
                 predicted_3d = self.get_predicted_stem_pos(now)
-                predicted_2d = None
                 if predicted_3d is not None and predicted_3d[2] > 0:
-                    fx, fy = self.K[0,0], self.K[1,1]
-                    cx, cy = self.K[0,2], self.K[1,2]
-                    u = int(fx * predicted_3d[0] / predicted_3d[2] + cx)
-                    v = int(fy * predicted_3d[1] / predicted_3d[2] + cy)
+                    u = int(self.K[0,0] * predicted_3d[0] / predicted_3d[2] + self.K[0,2])
+                    v = int(self.K[1,1] * predicted_3d[1] / predicted_3d[2] + self.K[1,2])
                     predicted_2d = (u, v)
-                    
-                    cv2.circle(vis_bgr, (u, v), 5, (255, 0, 0), -1)
+                    if self.show_rgb_win: cv2.circle(vis_bgr, (u, v), 5, (255, 0, 0), -1)
 
-                # YOLO Tracking ID 鎖定邏輯
-                stem_xyxy = None
-                # 策略 1: 優先透過 Tracker ID 尋找最穩定的框
-                if getattr(self, "target_stem_id", -1) != -1 and ids_all is not None:
-                    idx = np.where(ids_all == self.target_stem_id)[0]
-                    if len(idx) > 0:
-                        stem_xyxy = xyxy_all[idx[0]]
-                        # 可選：在畫面上印出 ID 確保有追到
-                        # cv2.putText(vis_bgr, f"TrackID:{self.target_stem_id}", (int(stem_xyxy[0]), int(stem_xyxy[1])-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                if self.stem_cutie_state == "CRUISING" and run_yolo:
+                    stem_xyxy = None
+                    if self.target_stem_id != -1 and ids_all is not None:
+                        idx = np.where(ids_all == self.target_stem_id)[0]
+                        if len(idx) > 0: stem_xyxy = xyxy_all[idx[0]]
 
-                # 策略 2: 如果 Tracker 追丟 (被遮擋或剛切換還沒配發ID)，退回空間距離預測
-                if stem_xyxy is None:
-                    if predicted_2d is not None:
-                        stem_xyxy, _, found_id = self.pick_nearest_to_2d_point(xyxy_all, sc_all, cl_all, ids_all, predicted_2d, self.cls_stem, self.max_dist_px)
-                        if stem_xyxy is None and (now - self.last_stem_time) > self.stem_lost_timeout:
-                            rospy.logwarn("[stem] Track lost timeout. Clearing history.")
-                            self.last_stem_3d_pos = None
-                            self.last_stem_time = None
-                            self.target_stem_id = -1
-                        elif stem_xyxy is not None:
-                            self.target_stem_id = found_id # 動態更新為新分配的 ID
-                    else:
-                        if bunch_xyxy is None:
-                            self.pump_windows(vis_bgr, self.depth_vis if self.got_depth else None)
-                            self._publish_zero_current(used_seg=used_seg)
-                            continue
-                        stem_xyxy, _, found_id = self.pick_nearest_from_dets(xyxy_all, sc_all, cl_all, ids_all, bunch_xyxy, self.cls_stem)
-                        if stem_xyxy is not None:
-                            self.target_stem_id = found_id
+                    if stem_xyxy is None:
+                        bunch_xyxy, _ = self.select_yolo_bbox(
+                            xyxy_all, sc_all, cl_all, img_shape=self.color.shape,
+                            prefer_cls=self.cls_bunch, select_mode="score", conf_th=self.det_conf
+                        )
+                        if bunch_xyxy is not None:
+                            stem_xyxy, _, f_id = self.pick_nearest_from_dets(xyxy_all, sc_all, cl_all, ids_all, bunch_xyxy, self.cls_stem)
+                            if stem_xyxy is not None: self.target_stem_id = f_id
+                        elif predicted_2d is not None:
+                            stem_xyxy, _, f_id = self.pick_nearest_to_2d_point(xyxy_all, sc_all, cl_all, ids_all, predicted_2d, self.cls_stem)
+                            if stem_xyxy is not None: self.target_stem_id = f_id
+                            elif (now - self.last_stem_time) > self.stem_lost_timeout:
+                                self.last_stem_3d_pos = None; self.last_stem_time = None; self.target_stem_id = -1
 
-                if stem_xyxy is None:
-                    self.pose_stem = None
-                    self.confidence_publish("stem", 0.0, False, used_seg=False)
-                    self.pump_windows(vis_bgr, self.depth_vis if self.got_depth else None)
-                    continue
-                # ========================================
+                    if stem_xyxy is not None:
+                        used_mask = self.seg_mask_from_yolo_seg(self.color, stem_xyxy, target_cls=self.cls_stem)
+                        if used_mask.sum() > 50:
+                            rospy.loginfo("[Hand-off] YOLO -> Cutie Locked STEM (ID=2)!")
+                            cutie_init_mask[used_mask] = 2
+                            cutie_init_objs.append(2)
+                            self.stem_cutie_state = "SERVOING"
 
-                stem_mask = self.seg_mask_from_yolo_seg(self.color, stem_xyxy, target_cls=self.cls_stem)
-                center_3d, quat, projected_2d, status = self.calculate_direct_root_pose(self.depth_m, stem_mask)
+            # ==========================================
+            # 3. 執行 Cutie 推論 (初始化 或 追蹤)
+            # ==========================================
+            pred_mask_tensor = None
+            if self.cutie_processor is not None:
+                if len(cutie_init_objs) > 0:
+                    init_mask_tensor = torch.from_numpy(cutie_init_mask).unsqueeze(0).cuda().long()
+                    with torch.cuda.amp.autocast(), torch.inference_mode():
+                        output_prob = self.cutie_processor.step(img_tensor, init_mask_tensor, objects=cutie_init_objs)
+                        pred_mask_tensor = self.cutie_processor.output_prob_to_mask(output_prob)
+                elif self.bunch_cutie_state == "SERVOING" or self.stem_cutie_state == "SERVOING":
+                    with torch.cuda.amp.autocast(), torch.inference_mode():
+                        output_prob = self.cutie_processor.step(img_tensor)
+                        pred_mask_tensor = self.cutie_processor.output_prob_to_mask(output_prob)
 
-                if center_3d is not None:
-                    self.last_stem_3d_pos = center_3d.copy()
-                    self.last_stem_time = now
-
-                    T = tf.transformations.quaternion_matrix(quat)
-                    T[0, 3] = center_3d[0]
-                    T[1, 3] = center_3d[1]
-                    T[2, 3] = center_3d[2]
-                    self.pose_stem = T
-
-                    # 1. 疊加葉莖的 Mask (使用半透明黃色，你可以改 color 參數換顏色)
-                    vis_bgr = self._overlay_mask(vis_bgr, stem_mask, alpha=0.5, color=(0, 255, 255))
-
-                    # 2. 標記根部 3D 投影點 (紅點與文字)
-                    cv2.circle(vis_bgr, projected_2d, 8, (0, 0, 255), -1) 
-                    cv2.putText(vis_bgr, f"Root Z:{center_3d[2]:.2f}m", (projected_2d[0] + 10, projected_2d[1] - 10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                    
-                    # 葉莖直接通過，不進入舊有尺寸檢查
-                    parent_frame = self.camera_tf if self.camera_tf else "camera_color_optical_frame"
-                    self.broadcast_transform_and_pose(self.pose_stem, "stem", parent_frame)
-                    self.confidence_publish("stem", 1.0, True, used_seg=used_seg)
+            # ==========================================
+            # 4. BUNCH SERVOING (處理果串 Cutie 結果與 3D 姿態)
+            # ==========================================
+            iou_for_bar = 0.0
+            if self.bunch_cutie_state == "SERVOING" and pred_mask_tensor is not None:
+                # 擷取 ID 1 的 Mask
+                bunch_mask_bool = (pred_mask_tensor.squeeze().cpu().numpy() == 1)
+                
+                if bunch_mask_bool.sum() < 100:
+                    rospy.logwarn("[BUNCH] Cutie track lost! Resetting all.")
+                    self._reset_all_to_bunch()
                 else:
+                    used_seg = True
+                    # 1. 繼續追蹤 6D 姿態
+                    self.pose_bunch = self.est_bunch.track_one(rgb=self.color, depth=self.depth_m, K=self.K, iteration=self.track_refine_iter)
+                    
+                    # 2. 使用 Cutie Mask 計算遮蔽率 OCC
+                    occ = self.occ_from_gt_mesh_vs_seg("bunch", bunch_mask_bool)
+                    
+                    # 3. 檢查 FP 是否飄走 (FoundationPose 救援機制)
+                    center_pose = self.pose_bunch @ np.linalg.inv(self.to_origin_bunch)
+                    fp_est_xyxy = self.project_3d_bbox_xyxy(self.K, center_pose, self.bbox_bunch, self.color.shape)
+                    fp_mask = self.rect_to_mask(self.depth_m, fp_est_xyxy, expand=0.0)
+                    
+                    iou = 0.0
+                    if fp_mask is not None:
+                        inter = np.logical_and(fp_mask, bunch_mask_bool).sum()
+                        union = np.logical_or(fp_mask, bunch_mask_bool).sum()
+                        iou = inter / union if union > 0 else 0.0
+                    iou_for_bar = iou
+                    
+                    ok_to_publish, pending = self.postprocess_and_maybe_reinit(self.pose_bunch, "bunch")
+                    
+                    # 如果 FP 的投影與 Cutie Mask 不匹配 (IoU 過低)，或姿態顛倒，強制使用 Cutie 的 ROI 重新對齊 FP
+                    if iou < self.iou_thresh or pending:
+                        rospy.logwarn(f"[BUNCH] FP Drifted (IoU={iou:.2f}) or Pose Bad. Rescuing with Cutie ROI!")
+                        self.pose_bunch = self.est_bunch.register(
+                            K=self.K, rgb=self.color, depth=self.depth_m, ob_mask=bunch_mask_bool, iteration=self.est_refine_iter
+                        )
+                        self._post_pending = False # 獲救後取消等待
+                        
+                    # 4. 判斷是否準備切換 Stem 模式
+                    if occ >= self.policy_occ_hi: self._hi_cnt += 1
+                    else: self._hi_cnt = 0
+
+                    if self._hi_cnt >= self.policy_hi_pat:
+                        self.mode = "stem"
+
+                    # 發布 TF 與影像
+                    if self.pose_bunch is not None:
+                        self.last_bunch_3d_pos = self.pose_bunch[:3, 3].copy()
+                        parent_frame = self.camera_tf if self.camera_tf else "camera_color_optical_frame"
+                        self.broadcast_transform_and_pose(self.pose_bunch, "bunch", parent_frame)
+                        self.confidence_publish("bunch", iou_for_bar, True, used_seg=True)
+                        
+                        if self.show_rgb_win:
+                            vis_bgr = self._overlay_mask(vis_bgr, bunch_mask_bool, alpha=0.4, color=(0, 0, 255)) # 果串紅色
+                            center_pose = self.pose_bunch @ np.linalg.inv(self.to_origin_bunch)
+                            vis_bgr = draw_posed_3d_box(self.K, img=cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB), ob_in_cam=center_pose, bbox=self.bbox_bunch)
+                            vis_bgr = draw_xyz_axis(vis_bgr, ob_in_cam=self.pose_bunch, scale=0.05, K=self.K, thickness=3, transparency=0, is_input_rgb=True)
+                            vis_bgr = cv2.cvtColor(vis_bgr, cv2.COLOR_RGB2BGR)
+
+            # ==========================================
+            # 5. STEM SERVOING (處理葉莖 Cutie 結果與 3D)
+            # ==========================================
+            if self.mode == "stem" and self.stem_cutie_state == "SERVOING" and pred_mask_tensor is not None:
+                # 擷取 ID 2 的 Mask
+                stem_mask_255 = (pred_mask_tensor.squeeze().cpu().numpy() == 2).astype(np.uint8) * 255
+                
+                # 腐蝕運算防多割
+                used_mask = cv2.erode(stem_mask_255, self.erode_kernel, iterations=self.erode_iterations)
+
+                if (used_mask / 255.0).sum() < 50:
+                    rospy.logwarn("[STEM] Cutie track lost! Reverting to YOLO Cruising.")
+                    self.stem_cutie_state = "CRUISING"
                     self.pose_stem = None
-                    cv2.putText(vis_bgr, f"Mapping Failed: {status}", (10, 60), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                     self.confidence_publish("stem", 0.0, False, used_seg=False)
+                else:
+                    center_3d, quat, projected_2d, status = self.calculate_direct_root_pose(self.depth_m, used_mask)
 
-            # 5) IoU bar
-            bar_w, bar_h, margin = 220, 18, 10
-            iou_show = float(iou_for_bar) if 'iou_for_bar' in locals() else 0.0
-            self.draw_conf_bar(
-                vis_bgr, {"IoU": iou_show},
-                label="IoU",
-                origin=(10, vis_bgr.shape[0] - margin - bar_h),
-                size=(bar_w, bar_h),
-                max_val=1.0
-            )
+                    if center_3d is not None:
+                        # [防呆 1] Z 軸生長約束 (消除前景葉片)
+                        if self.last_bunch_3d_pos is not None and center_3d[2] < (self.last_bunch_3d_pos[2] - 0.05):
+                            rospy.logwarn_throttle(0.5, "[stem] REJECTED: Foreground leaf (Z too close).")
+                            center_3d = None 
 
-            # 6) show
+                        # [防呆 2] 3D 空間跳動限制 (消除旁枝干擾)
+                        if center_3d is not None and predicted_3d is not None:
+                            jump_dist = float(np.linalg.norm(center_3d - predicted_3d))
+                            if jump_dist > self.stem_max_jump_m:  
+                                rospy.logwarn_throttle(0.5, f"[stem] REJECTED: Jumped {jump_dist:.2f}m")
+                                center_3d = None 
+
+                        # [平滑 3] EMA 濾波
+                        if center_3d is not None:
+                            if self.last_stem_3d_pos is not None:
+                                smoothed_3d = (self.stem_ema_alpha * center_3d) + ((1.0 - self.stem_ema_alpha) * self.last_stem_3d_pos)
+                            else:
+                                smoothed_3d = center_3d.copy()
+                                
+                            self.last_stem_3d_pos = smoothed_3d.copy()
+                            self.last_stem_time = now
+
+                            T = tf.transformations.quaternion_matrix(quat)
+                            T[0, 3] = smoothed_3d[0]; T[1, 3] = smoothed_3d[1]; T[2, 3] = smoothed_3d[2]
+                            self.pose_stem = T
+
+                            if self.show_rgb_win:
+                                vis_bgr = self._overlay_mask(vis_bgr, used_mask, alpha=0.5, color=(0, 255, 255)) # 葉莖黃色
+                                cv2.circle(vis_bgr, projected_2d, 8, (0, 0, 255), -1) 
+                                cv2.putText(vis_bgr, f"Root Z:{smoothed_3d[2]:.2f}m", (projected_2d[0] + 10, projected_2d[1] - 10), 
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                            
+                            parent_frame = self.camera_tf if self.camera_tf else "camera_color_optical_frame"
+                            self.broadcast_transform_and_pose(self.pose_stem, "stem", parent_frame)
+                            self.confidence_publish("stem", 1.0, True, used_seg=True)
+                            
+                    if center_3d is None:
+                        self.pose_stem = None
+                        self.confidence_publish("stem", 0.0, False, used_seg=False)
+
+            # ==========================================
+            # 6. 更新 GUI
+            # ==========================================
+            if self.show_rgb_win:
+                if self.bunch_cutie_state == "SERVOING":
+                    cv2.putText(vis_bgr, "BUNCH: CUTIE LOCKED", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                if self.mode == "stem" and self.stem_cutie_state == "SERVOING":
+                    cv2.putText(vis_bgr, f"STEM: CUTIE LOCKED (Erode:{self.erode_iterations})", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+                self.draw_conf_bar(vis_bgr, {"IoU": iou_for_bar}, label="IoU vs Mask",
+                                   origin=(10, vis_bgr.shape[0] - 28), size=(220, 18), max_val=1.0)
+                
             self.pump_windows(
                 vis_bgr if (self.show_rgb_win and self.color is not None) else None,
                 self.depth_vis if (self.show_depth_win and self.got_depth and self.depth_vis is not None) else None

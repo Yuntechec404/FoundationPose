@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import os, sys
+import time  # 新增時間模組用於效能分析
+import csv   # 新增：用於寫入效能資料
+from datetime import datetime # 新增：用於建立時間資料夾
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 指定使用哪一個GPU
 import rospy
 import numpy as np
@@ -26,7 +29,14 @@ if FOUNDATIONPOSE_SRC not in sys.path:
 os.environ.setdefault("ULTRALYTICS_NO_INSTALL", "1")
 
 from estimater import FoundationPose, draw_posed_3d_box, draw_xyz_axis, ScorePredictor, PoseRefinePredictor, dr
-from ultralytics import YOLO
+from ultralytics import YOLO, SAM
+
+# 嘗試載入 SAM (原版 Segment Anything)
+try:
+    from segment_anything import sam_model_registry, SamPredictor
+    _SAM_AVAILABLE = True
+except ImportError:
+    _SAM_AVAILABLE = False
 
 selecting_bbox = False
 box_points = []
@@ -34,10 +44,23 @@ box_points = []
 class FoundationPoseTracker:
     def __init__(self):
         self.init_parameter()
+        
+        # 建立時間戳 debug 資料夾
+        self._setup_run_debug_dir()
+        
+        # 初始化 CSV 效能紀錄檔
+        if self.perf_eval_enable:
+            self.perf_csv_path = os.path.join(self.debug_dir, "perf_eval.csv")
+            with open(self.perf_csv_path, mode='w', newline='') as f:
+                f.write("frame_count,segmentation_ms,initial_pose_ms,refine_pose_ms\n")
+        else:
+            self.perf_csv_path = None
+
         try:
             cv2.destroyAllWindows()
         except Exception:
             pass
+            
         self.bridge = CvBridge()
         self.color = None
         self.depth = None
@@ -53,6 +76,16 @@ class FoundationPoseTracker:
         self.iou_val = None
         self.K = None
         self._last_yolo_text = ""
+
+        # 效能分析數據 (ms) - 用於當幀計算與 CSV 寫入
+        self.time_seg = 0.0
+        self.time_init = 0.0
+        self.time_refine = 0.0
+        
+        # 效能分析快取數據 - 用於 OpenCV 顯示，避免跳動或歸零
+        self.ui_time_seg = 0.0
+        self.ui_time_init = 0.0
+        self.ui_time_refine = 0.0
 
         self._rgb_win_created = False
         self._depth_win_created = False
@@ -79,7 +112,6 @@ class FoundationPoseTracker:
         self.window_create()
 
         # foundationpose初始化
-        os.makedirs(self.debug_dir, exist_ok=True)
         self.mesh = trimesh.load(self.mesh_file)
         self.to_origin, self.extents = trimesh.bounds.oriented_bounds(self.mesh)
         self.to_origin = self.to_origin
@@ -91,11 +123,38 @@ class FoundationPoseTracker:
         self.est = FoundationPose(model_pts=self.mesh.vertices, model_normals=self.mesh.vertex_normals, mesh=self.mesh, scorer=self.scorer, refiner=self.refiner, debug_dir=self.debug_dir, debug=0, glctx=self.glctx,)
         rospy.loginfo("Estimator initialization done")
 
-        self.detector, self.det_device = self.load_detector(self.det_model)
+        # 決定 YOLO 任務 (如果使用 yolo11-seg，則任務必須為 segment)
+        task_type = 'segment' if self.seg_backend == 'yolo11-seg' else 'detect'
+        self.detector, self.det_device = self.load_detector(self.det_model, task=task_type)
         is_gpu, yolo_desc = self.yolo_uses_gpu(self.detector)
         rospy.loginfo(f"[YOLO] GPU enabled: {is_gpu}  ({yolo_desc})")
         rospy.loginfo(f"[YOLO] predict device hint: {self.det_device}")
         rospy.loginfo("Detector initialization done")
+
+        # SAM predictor 初始化
+        self.sam_predictor = None
+        if self.seg_backend == "sam" and _SAM_AVAILABLE:
+            try:
+                sam = sam_model_registry[self.sam_model](checkpoint=self.sam_ckpt)
+                if torch.cuda.is_available():
+                    sam.to(device="cuda")
+                self.sam_predictor = SamPredictor(sam)
+                rospy.loginfo("SAM loaded: %s", self.sam_model)
+            except Exception as e:
+                rospy.logwarn("SAM init failed: %r. Fallback to bbox mask.", e)
+        
+        # SAM2 Ultralytics 初始化
+        self.sam2_model = None
+        if self.seg_backend == "sam2":
+            try:
+                self.sam2_model = SAM(self.sam_ckpt)
+                rospy.loginfo(f"[SAM2] Loaded {self.sam_ckpt}")
+                # 預熱 SAM2
+                dummy = np.zeros((self.det_imgsz, self.det_imgsz, 3), np.uint8)
+                _ = self.sam2_model(dummy, bboxes=[[10,10,100,100]], imgsz=self.det_imgsz, device="cuda:0" if torch.cuda.is_available() else "cpu", verbose=False)
+            except Exception as e:
+                rospy.logwarn(f"[SAM2] init failed: {e}")
+                self.sam2_model = None
 
     def init_parameter(self):
         # 參數
@@ -110,14 +169,22 @@ class FoundationPoseTracker:
         self.object_name = gp("object_name", "tracked_object")
 
         self.mesh_file = gp("mesh_file", "")
-        self.det_model = gp("det_model", "yolov11n.onnx")
+        self.det_model = gp("det_model", "yolo11n-seg.pt") # 預設改為 seg
         self.init_mode = gp("init_mode", "yolo")
         self.yolo_start_mode = gp("yolo_start_mode", "immediate").strip().lower()
         self.det_conf = float(gp("det_conf", 0.25))
         self.det_class = int(gp("det_class", -1))
         self.est_refine_iter = int(gp("est_refine_iter", 5))
         self.track_refine_iter = int(gp("track_refine_iter", 2))
-        self.debug_dir = gp("debug_dir", "/tmp/fp_debug")
+        
+        # 改為 debug_root 以配合新的建立資料夾邏輯
+        self.debug_root = gp("debug_dir", "/tmp/fp_debug")
+
+        # 效能分析與分割參數
+        self.perf_eval_enable = bool(gp("perf_eval_enable", True))
+        self.seg_backend = gp("seg_backend", "yolo11-seg").strip().lower() # bbox, yolo11-seg, sam, sam2
+        self.sam_model = gp("sam_model", "vit_h").strip()
+        self.sam_ckpt = gp("sam_ckpt", "/home/user/.cache/sam_vit_h.pth").strip()
 
         self.roi_expand = float(gp("roi_expand", 0.02))
         self.iou_stride = int(gp("iou_stride", 1))
@@ -127,8 +194,9 @@ class FoundationPoseTracker:
         self.det_imgsz = int(gp("det_imgsz", 640))
         self.prefer_cls = None if self.det_class < 0 else self.det_class
 
+        # Updated ROI strategy
         self.det_select_mode = gp("det_select_mode", "score").strip().lower()
-        if self.det_select_mode not in ("score", "top", "bottom"):
+        if self.det_select_mode not in ("score", "middle", "nearest_depth"):
             rospy.logwarn("Unknown det_select_mode=%s, fallback to 'score'", self.det_select_mode)
             self.det_select_mode = "score"
 
@@ -144,19 +212,57 @@ class FoundationPoseTracker:
         self.invert_colormap = bool(gp("invert_colormap", False))
 
         self.pp_enable = bool(gp("postproc/enable", True))
-        self.pp_up_axis = gp("postproc/up_axis", "y").strip().lower() # 模型哪個軸代表「上」：'x'|'y'|'z'
-        self.pp_expect_orientation = gp("postproc/expect_orientation", "upright").strip().lower() # 預期方向：'upright' 或 'inverted'
-        self.pp_orient_center_tol_px = float(gp("postproc/orient_center_tol_px", 20.0)) # 容許中心偏移(px)
-        self.pp_size_mode = gp("postproc/size_mode", "bbox_mm").strip().lower() # 'bbox_mm' 或 'depth'
-        self.pp_expect_bbox_w_mm = float(gp("postproc/expect_bbox_w_mm", 220.0)) # 預期寬度(mm)
-        self.pp_expect_bbox_h_mm = float(gp("postproc/expect_bbox_h_mm", 300.0)) # 預期高度(mm)
-        self.pp_size_ratio_min = float(gp("postproc/size_ratio_min", 0.8))  # 尺寸比例下限
-        # 或者用相機座標 Z 距離（公尺）檢查
+        self.pp_up_axis = gp("postproc/up_axis", "y").strip().lower() 
+        self.pp_expect_orientation = gp("postproc/expect_orientation", "upright").strip().lower() 
+        self.pp_orient_center_tol_px = float(gp("postproc/orient_center_tol_px", 20.0)) 
+        self.pp_size_mode = gp("postproc/size_mode", "bbox_mm").strip().lower() 
+        self.pp_expect_bbox_w_mm = float(gp("postproc/expect_bbox_w_mm", 220.0)) 
+        self.pp_expect_bbox_h_mm = float(gp("postproc/expect_bbox_h_mm", 300.0)) 
+        self.pp_size_ratio_min = float(gp("postproc/size_ratio_min", 0.8))  
         self.pp_expect_depth_m = float(gp("postproc/expect_depth_m", 1.2))
         self.pp_depth_tol_m = float(gp("postproc/depth_tolerance_m", 0.25))
-        self.pp_retry_delay_sec = float(gp("postproc/retry_delay_sec", 1.0))  # 延遲秒數
-        # 不符預期時的動作：'reinit'（重新偵測）或 'keep'（忽略）
+        self.pp_retry_delay_sec = float(gp("postproc/retry_delay_sec", 1.0))
         self.pp_on_fail = gp("postproc/on_fail", "reinit").strip().lower()
+
+    # =========================
+    # Debug 資料夾與路徑工具
+    # =========================
+    def _setup_run_debug_dir(self):
+        """建立本次執行存放 Debug 圖片的專屬時間戳資料夾。"""
+        root = getattr(self, "debug_root", None) or getattr(self, "debug_dir", "/tmp/fp_debug")
+        ts = datetime.now().strftime("%Y%m%d-%H%M_tracker")
+        base = os.path.join(root, ts)
+        run_dir = base
+        k = 1
+        while os.path.exists(run_dir):
+            run_dir = f"{base}_{k:02d}"
+            k += 1
+        self.debug_dir = run_dir
+        os.makedirs(self.debug_dir, exist_ok=True)
+        rospy.loginfo(f"[DBG] debug_dir (this run) = {self.debug_dir}")
+
+    def _ensure_dir(self, d=None):
+        """確保目錄存在，若無則建立。"""
+        if d is None: d = getattr(self, "debug_dir", None)
+        if not d: return
+        try: os.makedirs(d, exist_ok=True)
+        except Exception: pass
+
+    def _ensure_parent(self, path: str):
+        """確保檔案的上層目錄存在，若無則建立。"""
+        try:
+            parent = os.path.dirname(path)
+            if parent: os.makedirs(parent, exist_ok=True)
+        except Exception: pass
+
+    def _dbg_path(self, subdir: str, prefix: str):
+        """產生除錯圖片的完整存檔路徑 (自動帶上當前的 frame_count)。"""
+        root = os.path.join(self.debug_dir, subdir)
+        self._ensure_dir(root)
+        p = os.path.join(root, f"{prefix}_{self.frame_count:06d}.png")
+        self._ensure_parent(p)
+        return p
+
     # =========================
     # YOLO 後端/裝置資訊工具
     # =========================
@@ -166,11 +272,7 @@ class FoundationPoseTracker:
         m = getattr(detector, "model", None)
         if m is None:
             return info
-
-        # 可能存在的後端描述
         info["engine"] = str(getattr(m, "backend", getattr(m, "engine", "")))
-
-        # PyTorch：檢查參數是否在CUDA
         try:
             if hasattr(m, "parameters"):
                 p = next(m.parameters(), None)
@@ -178,8 +280,6 @@ class FoundationPoseTracker:
                     info["torch_device"] = str(p.device)
         except Exception:
             pass
-
-        # ONNX Runtime：檢查 providers
         sess = None
         for attr in ("session", "ort_session", "session_ort"):
             s = getattr(m, attr, None)
@@ -195,7 +295,6 @@ class FoundationPoseTracker:
             prov = getattr(m, "providers", None)
             if prov is not None:
                 info["ort_providers"] = list(prov)
-
         return info
 
     def yolo_uses_gpu(self,detector):
@@ -204,30 +303,15 @@ class FoundationPoseTracker:
         eng = (info["engine"] or "").lower()
         dev = (info["torch_device"] or "").lower()
         prov = info["ort_providers"] or []
-
-        # ONNX Runtime：看到 CUDAExecutionProvider 就代表用 GPU
         if any("CUDAExecutionProvider" == p for p in prov):
             return True, f"engine={eng or 'onnxruntime'} providers={prov}"
-
-        # TensorRT（若用 trt 匯出）
         if "tensorrt" in eng:
             return True, f"engine={eng}"
-
-        # PyTorch：參數在 cuda 裝置上
         if dev.startswith("cuda"):
             return True, f"engine={eng or 'pytorch'} device={dev}"
-
         return False, f"engine={eng or 'unknown'} providers={prov or 'None'} device={dev or 'None'}"
 
-    def load_detector(self, model_path: str):
-        """
-        載入偵測模型（僅支援 .pt / .onnx）
-        規則：
-          - .pt：優先 GPU（model.to('cuda') / predict(device=0)），失敗則 CPU；若載入本身失敗且旁邊有同名 .onnx，切到 .onnx
-          - .onnx：優先 CUDAExecutionProvider，失敗則 CPUExecutionProvider
-        回傳: (detector, det_device_str)
-           det_device_str 會給 predict() 當 device 參數（對 .pt 有效；.onnx 會被忽略）
-        """
+    def load_detector(self, model_path: str, task='detect'):
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"detector model not found: {model_path}")
 
@@ -240,20 +324,18 @@ class FoundationPoseTracker:
 
         if ext == ".pt":
             rospy.loginfo(f"[YOLO Loader] Loading PyTorch (.pt): {model_path}")
-            # 先試 GPU
             try:
-                det = YOLO(model_path)   # 會自動推斷任務
+                det = YOLO(model_path, task=task)
                 if torch.cuda.is_available():
                     try:
                         det.to("cuda:0")
-                        det_device = 0  # predict(device=0)
+                        det_device = 0 
                         rospy.loginfo("[YOLO Loader] PT on GPU OK")
                         return det, det_device
                     except Exception as ge:
                         rospy.logwarn(f"[YOLO Loader] PT move to GPU failed: {ge}. Will try PT on CPU.")
                 else:
                     rospy.logwarn("[YOLO Loader] No CUDA available; PT will run on CPU.")
-                # 再試 CPU
                 try:
                     det.to("cpu")
                     det_device = "cpu"
@@ -261,58 +343,41 @@ class FoundationPoseTracker:
                     return det, det_device
                 except Exception as ce:
                     rospy.logwarn(f"[YOLO Loader] PT on CPU failed: {ce}")
-
             except Exception as e:
                 rospy.logwarn(f"[YOLO Loader] PT load failed: {e}")
 
-            # 到這裡表示 .pt 失敗，若旁邊有同名 .onnx 就用它
             onnx_fallback = _onnx_sibling(model_path)
             if os.path.isfile(onnx_fallback):
                 rospy.loginfo(f"[YOLO Loader] Trying fallback ONNX: {onnx_fallback}")
-                det, det_device = self._load_onnx_with_gpu_fallback(onnx_fallback)
+                det, det_device = self._load_onnx_with_gpu_fallback(onnx_fallback, task=task)
                 return det, det_device
             else:
-                raise RuntimeError(f"Failed to load PT '{model_path}' and no sibling ONNX found.\n"
-                                    "Hint: 這通常是 .pt 與 ultralytics 版本不相容；請改用 .onnx 或調整 ultralytics 版本。")
+                raise RuntimeError(f"Failed to load PT '{model_path}' and no sibling ONNX found.")
         elif ext == ".onnx":
             rospy.loginfo(f"[YOLO Loader] Loading ONNX: {model_path}")
-            det, det_device = self._load_onnx_with_gpu_fallback(model_path)
+            det, det_device = self._load_onnx_with_gpu_fallback(model_path, task=task)
             return det, det_device
         else:
             raise ValueError(f"Unsupported detector extension: {ext}. Use .pt or .onnx")
         
-    def _load_onnx_with_gpu_fallback(self, onnx_path: str):
-        """
-        優先用 CUDAExecutionProvider；若不可用或失敗則改 CPUExecutionProvider。
-        回傳: (detector, det_device_str)；對 ONNX 來說 det_device_str 只是提示字串。
-        """
-        # 先照常載入
-        det = YOLO(onnx_path, task="detect")
-
-        # 嘗試檢查/切換 providers
+    def _load_onnx_with_gpu_fallback(self, onnx_path: str, task='detect'):
+        det = YOLO(onnx_path, task=task)
         sess = None
         for attr in ("session", "ort_session", "session_ort"):
             s = getattr(det.model, attr, None)
             if s is not None:
                 sess = s
                 break
-
-        # 預設提示
         det_device = "cpu(ORT)"
-
         if sess is not None:
             try:
                 provs = list(sess.get_providers())
             except Exception:
                 provs = []
-
-            # 若已經有 CUDA provider 就直接用
             if "CUDAExecutionProvider" in provs:
                 rospy.loginfo(f"[YOLO Loader] ONNX providers={provs} (GPU OK)")
                 det_device = "cuda(ORT)"
                 return det, det_device
-
-            # 沒有 CUDA provider → 試著設定成 GPU，再不行用 CPU
             try:
                 sess.set_providers(["CUDAExecutionProvider", "CPUExecutionProvider"])
                 provs2 = list(sess.get_providers())
@@ -323,9 +388,7 @@ class FoundationPoseTracker:
                 else:
                     rospy.logwarn(f"[YOLO Loader] ONNX CUDA provider not available, using CPU providers={provs2}")
             except Exception as ge:
-                rospy.logwarn(f"[YOLO Loader] ONNX set_providers to CUDA failed: {ge}. Will use CPUExecutionProvider.")
-
-            # 最後：CPU
+                rospy.logwarn(f"[YOLO Loader] ONNX set_providers to CUDA failed: {ge}.")
             try:
                 sess.set_providers(["CPUExecutionProvider"])
             except Exception:
@@ -334,9 +397,9 @@ class FoundationPoseTracker:
             det_device = "cpu(ORT)"
             return det, det_device
 
-        # 如果拿不到 session，就照預設（Ultralytics 內部會自己決定）
         rospy.logwarn("[YOLO Loader] ONNX session not exposed; provider control skipped.")
         return det, det_device
+
     # =========================
     # 偵測 / BBox / 幾何工具
     # =========================
@@ -374,61 +437,86 @@ class FoundationPoseTracker:
         ub = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
         return float(inter / (ua + ub - inter + 1e-6))
 
-    def yolo_det_xyxy(self, detector: YOLO, img_bgr, imgsz=640, conf=0.25, prefer_cls=None, mode="score"):
+    def yolo_det_xyxy_mask(self, detector: YOLO, img_bgr, imgsz=640, conf=0.25, prefer_cls=None, mode="score"):
         """
-        回傳單一最佳框 (xyxy, score, cls)，挑選策略由mode控制：
-        - 'score': 分數最高
-        - 'top': 最靠上 (y1 最小)
-        - 'bottom':最靠下 (y2 最大)
-        會先以conf做門檻過濾；若有prefer_cls，會再以類別過濾。
+        回傳單一最佳目標的 (xyxy, score, cls, mask_data)
         """
+        t0 = time.perf_counter()
         r = detector.predict(source=img_bgr, imgsz=imgsz, conf=conf, device=self.det_device, verbose=False)[0]
+        if self.perf_eval_enable: 
+            self.time_seg = (time.perf_counter() - t0) * 1000.0
+
         if len(r.boxes) == 0:
-            return None, 0.0, None
+            return None, 0.0, None, None
 
-        xyxy = r.boxes.xyxy.cpu().numpy().astype(np.float32)   # (N,4)
-        sc = r.boxes.conf.cpu().numpy().astype(np.float32)   # (N,)
-        cl = r.boxes.cls.cpu().numpy().astype(int)           # (N,)
+        xyxy = r.boxes.xyxy.cpu().numpy().astype(np.float32)   
+        sc = r.boxes.conf.cpu().numpy().astype(np.float32)   
+        cl = r.boxes.cls.cpu().numpy().astype(int)            
+        masks = r.masks.data.cpu().numpy() if r.masks is not None else None
 
-        # 先以分數門檻過濾
         mask = (sc >= float(conf))
-
-        # 若指定類別，則進一步過濾
         if prefer_cls is not None:
             mask = mask & (cl == int(prefer_cls))
 
         idxs = np.where(mask)[0]
         if idxs.size == 0:
-            return None, 0.0, None
+            return None, 0.0, None, None
 
         mode = (mode or "score").lower()
-        if mode == "top":
-            # y1 最小（越靠上）
-            y1 = xyxy[idxs, 1]
-            pick = idxs[np.argmin(y1)]
-        elif mode == "bottom":
-            # y2 最大（越靠下）
-            y2 = xyxy[idxs, 3]
-            pick = idxs[np.argmax(y2)]
-        else:
-            # 'score'：分數最高
+        H, W = img_bgr.shape[:2]
+
+        if mode == "middle":
+            cx_img, cy_img = W / 2.0, H / 2.0
+            centers_x = (xyxy[idxs, 0] + xyxy[idxs, 2]) / 2.0
+            centers_y = (xyxy[idxs, 1] + xyxy[idxs, 3]) / 2.0
+            dists = (centers_x - cx_img)**2 + (centers_y - cy_img)**2
+            pick = idxs[np.argmin(dists)]
+            
+        elif mode == "nearest_depth" and hasattr(self, "depth_m"):
+            min_depth = float('inf')
+            pick = idxs[0] # Default fallback
+            
+            # Create a smooth depth map for testing
+            temp_depth = self.depth_m.copy()
+            temp_depth[temp_depth == 0] = np.max(temp_depth)
+            temp_depth = cv2.GaussianBlur(temp_depth, (3, 3), 0)
+            
+            for idx in idxs:
+                if masks is not None:
+                    # Resize mask if necessary
+                    m = masks[idx]
+                    if m.shape != (H, W):
+                        m = cv2.resize(m.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
+                    v_inst, u_inst = np.where(m > 0)
+                else:
+                    # Fallback to bbox if masks aren't available
+                    m = self.rect_to_mask(temp_depth, xyxy[idx])
+                    v_inst, u_inst = np.where(m > 0)
+                    
+                if len(v_inst) > 0:
+                    z_vals = temp_depth[v_inst, u_inst]
+                    # Filter out invalid depth values (e.g. < 0.1 or > 5.0)
+                    valid_z = z_vals[(z_vals > 0.1) & (z_vals < 5.0)]
+                    if len(valid_z) > 0:
+                        med_z = np.median(valid_z)
+                        if med_z < min_depth:
+                            min_depth = med_z
+                            pick = idx
+
+        else: # Default is "score"
             pick = idxs[np.argmax(sc[idxs])]
 
-        return xyxy[pick], float(sc[pick]), int(cl[pick])
+        target_mask = masks[pick] if masks is not None else None
+        return xyxy[pick], float(sc[pick]), int(cl[pick]), target_mask
 
     def yolo_det_all(self, detector: YOLO, img_bgr, imgsz=640, conf=0.25):
-        """
-        回傳所有偵測：
-        xyxy: (N,4) float32
-        sc:   (N,)  float32
-        cl:   (N,)  int32
-        若沒有偵測，三者皆為長度 0 的陣列。
-        """
+        t0 = time.perf_counter()
         r = detector.predict(source=img_bgr, imgsz=imgsz, conf=conf, device=self.det_device, verbose=False)[0]
+        if self.perf_eval_enable: 
+            self.time_seg = (time.perf_counter() - t0) * 1000.0
+
         if len(r.boxes) == 0:
-            return (np.empty((0, 4), dtype=np.float32),
-                    np.empty((0,), dtype=np.float32),
-                    np.empty((0,), dtype=np.int32))
+            return (np.empty((0, 4), dtype=np.float32), np.empty((0,), dtype=np.float32), np.empty((0,), dtype=np.int32))
         xyxy = r.boxes.xyxy.cpu().numpy().astype(np.float32)
         sc   = r.boxes.conf.cpu().numpy().astype(np.float32)
         cl   = r.boxes.cls.cpu().numpy().astype(np.int32)
@@ -440,7 +528,7 @@ class FoundationPoseTracker:
         xs = [mn[0], mx[0]]
         ys = [mn[1], mx[1]]
         zs = [mn[2], mx[2]]
-        corners = np.array([[x, y, z, 1.0] for x in xs for y in ys for z in zs], dtype=np.float64)  # (8,4)
+        corners = np.array([[x, y, z, 1.0] for x in xs for y in ys for z in zs], dtype=np.float64)  
         Pc = (center_pose @ corners.T).T
         Z = Pc[:, 2]
         valid = Z > 1e-6
@@ -451,12 +539,61 @@ class FoundationPoseTracker:
         u = K[0, 0] * X + K[0, 2]
         v = K[1, 1] * Y + K[1, 2]
         return self.clip_xyxy(np.array([u.min(), v.min(), u.max(), v.max()], dtype=np.float32), W, H)
+
+    # =========================
+    # Segmentation 邏輯整合
+    # =========================
+    def get_segmentation_mask(self, color, depth, xyxy, yolo_mask_data=None):
+        """根據參數產生最終註冊用的 Mask"""
+        H, W = color.shape[:2]
+        if xyxy is None:
+            return np.zeros((H, W), dtype=bool)
+
+        x1, y1, x2, y2 = self.clip_xyxy(xyxy, W, H).astype(int)
+
+        if self.seg_backend == 'yolo11-seg' and yolo_mask_data is not None:
+            if yolo_mask_data.shape != (H, W):
+                mask = cv2.resize(yolo_mask_data.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
+            else:
+                mask = yolo_mask_data
+            return mask.astype(bool)
+
+        elif self.seg_backend == 'sam' and self.sam_predictor is not None:
+            t0 = time.perf_counter()
+            self.sam_predictor.set_image(cv2.cvtColor(color, cv2.COLOR_BGR2RGB))
+            box = np.array([x1, y1, x2, y2], dtype=np.int32)
+            masks, scores, _ = self.sam_predictor.predict(box=box[None, :], multimask_output=True)
+            if self.perf_eval_enable: 
+                self.time_seg += (time.perf_counter() - t0) * 1000.0
+            if masks is not None and len(masks) > 0:
+                return masks[int(np.argmax(scores))].astype(bool)
+
+        elif self.seg_backend == 'sam2' and self.sam2_model is not None:
+            t0 = time.perf_counter()
+            results = self.sam2_model(color, bboxes=[[int(x1), int(y1), int(x2), int(y2)]], imgsz=self.det_imgsz, device="cuda:0" if torch.cuda.is_available() else "cpu", verbose=False)
+            if self.perf_eval_enable: 
+                self.time_seg += (time.perf_counter() - t0) * 1000.0
+            
+            m = results[0].masks.data
+            if torch.is_tensor(m):
+                m = m.detach().cpu().numpy()
+            m = np.asarray(m)
+            
+            if m.ndim == 3:
+                m2 = m[0]
+            else:
+                m2 = m
+            
+            if m2.shape != (H, W):
+                m2 = cv2.resize(m2.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
+            return (m2 > 0).astype(bool)
+
+        # 預設或 fallback 為 bbox
+        return self.rect_to_mask(depth, xyxy, expand=self.roi_expand)
+
     # =========================
     # 滑鼠點選ROI
     # =========================
-    box_points = []
-    selecting_bbox = False
-
     def _open_window(self, name, pos_xy, init_size, is_rgb=True):
         w, h = init_size
         try:
@@ -474,18 +611,6 @@ class FoundationPoseTracker:
             self._depth_win_created = True
             self._depth_win_sized = False
 
-    def _close_window(self, name, is_rgb=True):
-        try:
-            cv2.destroyWindow(name)
-        except Exception:
-            pass
-        if is_rgb:
-            self._rgb_win_created = False
-            self._rgb_win_sized = False
-        else:
-            self._depth_win_created = False
-            self._depth_win_sized = False
-
     def window_create(self):
         if self.show_rgb_win and not self._rgb_win_created:
             self._open_window(self.rgb_win_name, self.rgb_win_xy, self._rgb_initial_size, is_rgb=True)
@@ -493,14 +618,11 @@ class FoundationPoseTracker:
             self._open_window(self.depth_win_name, self.depth_win_xy, self._depth_initial_size, is_rgb=False)
 
     def pump_windows(self, rgb_frame=None, depth_frame=None):
-        """統一處理視窗建立/移動/縮放/顯示/事件，確保即使尚未偵測也會持續更新。"""
-        # 先確保 window 存在
         if self.show_rgb_win and not self._rgb_win_created:
             self._open_window(self.rgb_win_name, self.rgb_win_xy, self._rgb_initial_size, is_rgb=True)
         if self.show_depth_win and not self._depth_win_created:
             self._open_window(self.depth_win_name, self.depth_win_xy, self._depth_initial_size, is_rgb=False)
 
-        # 若沒給影像，用空畫面頂住，避免 GUI 停住
         if rgb_frame is None and self.show_rgb_win:
             rgb_frame = np.zeros((480, 640, 3), dtype=np.uint8)
             cv2.putText(rgb_frame, "Waiting for detection / click init...", (20, 40),
@@ -508,8 +630,16 @@ class FoundationPoseTracker:
         if depth_frame is None and self.show_depth_win:
             depth_frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
-        # 顯示 + 初始定位/尺寸（確保 move/resize 真的跑到）
         if self.show_rgb_win and rgb_frame is not None:
+            # 加上效能分析字樣，並更新 cache 變數（僅當大於 0 時更新，避免跳動成 0）
+            if self.perf_eval_enable:
+                if getattr(self, 'time_seg', 0) > 0: self.ui_time_seg = self.time_seg
+                if getattr(self, 'time_init', 0) > 0: self.ui_time_init = self.time_init
+                if getattr(self, 'time_refine', 0) > 0: self.ui_time_refine = self.time_refine
+                
+                cv2.putText(rgb_frame, f"Segmentation: {self.ui_time_seg:.1f}ms | Initial: {self.ui_time_init:.1f}ms | Refiner: {self.ui_time_refine:.1f}ms", 
+                            (10, rgb_frame.shape[0] - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
             cv2.imshow(self.rgb_win_name, rgb_frame)
             if not self._rgb_win_sized:
                 w, h = self._rgb_initial_size
@@ -525,42 +655,9 @@ class FoundationPoseTracker:
                 cv2.moveWindow(self.depth_win_name, int(self.depth_win_xy[0]), int(self.depth_win_xy[1]))
                 self._depth_win_sized = True
 
-        # 永遠跑 waitKey 讓 GUI 有事件循環
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             rospy.signal_shutdown("user quit")
-        elif key == ord('d'):
-            self.toggle_depth_window()
-        elif key == ord('r'):
-            self.toggle_rgb_window()
-        
-    def ensure_window(self, name, xy, size=(900, 720)):
-        try:
-            cv2.getWindowProperty(name, 0)  # 會丟例外代表視窗不存在
-        except cv2.error:
-            cv2.namedWindow(name, cv2.WINDOW_NORMAL)
-            cv2.moveWindow(name, int(xy[0]), int(xy[1]))
-            cv2.resizeWindow(name, size[0], size[1])
-
-    def toggle_depth_window(self):
-        self.show_depth_win = not self.show_depth_win
-        if self.show_depth_win:
-            self.ensure_window(self.depth_win_name, self.depth_win_xy)
-        else:
-            try:
-                cv2.destroyWindow(self.depth_win_name)
-            except cv2.error:
-                pass
-
-    def toggle_rgb_window(self):
-        self.show_rgb_win = not self.show_rgb_win
-        if self.show_rgb_win:
-            self.ensure_window(self.rgb_win_name, self.rgb_win_xy)
-        else:
-            try:
-                cv2.destroyWindow(self.rgb_win_name)
-            except cv2.error:
-                pass
 
     def click_bbox(self, event, x, y, flags, param):
         global box_points
@@ -569,7 +666,6 @@ class FoundationPoseTracker:
             rospy.loginfo(f"Clicked point: {x}, {y}")
 
     def select_bbox(self, color):
-        """開始手動選框流程"""
         global box_points, selecting_bbox
         box_points.clear()
         selecting_bbox = True
@@ -578,18 +674,15 @@ class FoundationPoseTracker:
         return True
 
     def update_bbox_selection(self, color):
-        """更新手動選框流程狀態"""
         global box_points, selecting_bbox
         if not selecting_bbox:
             return True
 
-        # 階段1：等第一點
         if len(box_points) < 1:
             display_img = color.copy()
             self.pump_windows(display_img, self.depth_vis if self.got_depth else None)
             return False
 
-        # 階段2：等第二點
         elif len(box_points) < 2:
             display_img = color.copy()
             for pt in box_points:
@@ -597,14 +690,12 @@ class FoundationPoseTracker:
             self.pump_windows(display_img, self.depth_vis if self.got_depth else None)
             return False
 
-        # 完成
         else:
             selecting_bbox = False
             rospy.loginfo(f"Bounding Box selected: {box_points}")
             return True
 
     def create_mask(self, depth, bbox_points):
-        """依手動 bbox 產生 mask"""
         x1, y1 = bbox_points[0]
         x2, y2 = bbox_points[1]
         x_min, x_max = min(x1, x2), max(x1, x2)
@@ -612,79 +703,76 @@ class FoundationPoseTracker:
         mask = np.zeros_like(depth, dtype=bool)
         mask[y_min:y_max, x_min:x_max] = True
         return mask
-    # =========================
-    # 視覺化 / 文字疊圖
-    # =========================
+
     def draw_conf_bar(self, img, value, label="confidence", origin=(10, 30), size=(220, 18), max_val=1.0):
         val = float(value.get(label, 0.0))
         mv = max(1e-6, float(max_val))
         v = max(0.0, min(val / mv, 1.0))
-
         x, y = origin
         w, h = size
-        # 背景
         cv2.rectangle(img, (x, y), (x + w, y + h), (40, 40, 40), thickness=-1)
-        # 進度
         cv2.rectangle(img, (x, y), (x + int(w * v), y + h), (60, 180, 75), thickness=-1)
-        # 邊框
         cv2.rectangle(img, (x, y), (x + w, y + h), (220, 220, 220), thickness=1)
-        # 文字
         cv2.putText(img, f"{label}: {val:.3f}", (x, y - 6),cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+
     # =========================
-    # 初始化 / 追蹤輔助（YOLO + IoU）
+    # 初始化 / 追蹤輔助
     # =========================
     def init_via_yolo_roi(self, detector, color, depth, K, est, est_refine_iter, roi_expand, det_imgsz, det_conf, prefer_cls):
-        """用 YOLO 取 ROI，建立 mask 後呼叫 register"""
         H, W = color.shape[:2]
-        det_xyxy, det_score, det_cls = self.yolo_det_xyxy(detector, color, imgsz=det_imgsz, conf=det_conf, prefer_cls=prefer_cls, mode=self.det_select_mode)
+        
+        # 使用可以抽出 mask 的 YOLO 函式
+        det_xyxy, det_score, det_cls, det_mask_data = self.yolo_det_xyxy_mask(
+            detector, color, imgsz=det_imgsz, conf=det_conf, prefer_cls=prefer_cls, mode=self.det_select_mode
+        )
+
         if det_xyxy is None:
             vis = color.copy()
             cv2.putText(vis, "YOLO ROI not found - waiting...", (20, 40),cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
             self.pump_windows(vis, self.depth_vis if self.got_depth else None)
             return None, None, None, None
 
-        det_xyxy = self.clip_xyxy(det_xyxy, W, H)
-        mask = self.rect_to_mask(depth, det_xyxy, expand=roi_expand)
+        # 根據 Backend 取得精準遮罩
+        mask = self.get_segmentation_mask(color, depth, det_xyxy, det_mask_data)
+        
+        # 進行初始姿態註冊並記錄時間
+        t0 = time.perf_counter()
         pose = est.register(K=K, rgb=color, depth=depth, ob_mask=mask, iteration=est_refine_iter)
+        if self.perf_eval_enable: 
+            self.time_init = (time.perf_counter() - t0) * 1000.0
 
-        # 可視化初始化 ROI
         init_vis = color.copy()
         x1, y1, x2, y2 = det_xyxy.astype(int)
         cv2.rectangle(init_vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(init_vis, f"INIT ROI s={det_score:.2f}", (x1, max(0, y1 - 8)),cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+        # 若是分割模式，可以疊加綠色半透明顯示 Mask
+        if self.seg_backend != 'bbox':
+            init_vis[mask] = init_vis[mask] * 0.5 + np.array([0, 255, 0]) * 0.5
+            
+        cv2.putText(init_vis, f"INIT ROI s={det_score:.2f} ({self.det_select_mode})", (x1, max(0, y1 - 8)),cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
         self.pump_windows(init_vis, self.depth_vis if self.got_depth else None)
         return pose, mask, det_xyxy, det_score
 
-    def periodic_yolo_iou(self, frame_count, stride, detector, color, center_pose, bbox_minmax, K,
-                        det_imgsz, det_conf, prefer_cls, vis_bgr, log=False):
-        """
-        每 N 幀用 YOLO 算一次 bbox，和 3D 投影 bbox 比 IoU，並在左上角印 YOLO 資訊。
-        回傳 (更新後影像, iou_val)
-        """
+    def periodic_yolo_iou(self, frame_count, stride, detector, color, center_pose, bbox_minmax, K, det_imgsz, det_conf, prefer_cls, vis_bgr, log=False):
         iou_val = None
-        # 不是計算幀：沿用上次文字，避免畫面忽隱忽現
         if detector is None or center_pose is None or (frame_count % max(1, stride) != 0):
             if self._last_yolo_text:
                 cv2.putText(vis_bgr, self._last_yolo_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 1, cv2.LINE_AA)
             return vis_bgr, None
     
         H, W = color.shape[:2]
-
-        # 投影 bbox
         est_xyxy = self.project_3d_bbox_xyxy(K, center_pose, bbox_minmax, img_shape=color.shape)
         if est_xyxy is None:
             xyxy_all, sc_all, cl_all = self.yolo_det_all(detector, color, imgsz=det_imgsz, conf=det_conf)
             self._last_yolo_text = f"YOLO det={len(xyxy_all)}"
-            cv2.putText(vis_bgr, self._last_yolo_text, (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
+            cv2.putText(vis_bgr, self._last_yolo_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
             return vis_bgr, None
-        # YOLO 偵測
+
         xyxy_all, sc_all, cl_all = self.yolo_det_all(detector, color, imgsz=det_imgsz, conf=det_conf)
         if len(xyxy_all) == 0:
             self._last_yolo_text = "YOLO det=0"
             cv2.putText(vis_bgr, self._last_yolo_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
             return vis_bgr, 0.0
-        # 類別篩選
+
         use_mask = np.ones(len(xyxy_all), dtype=bool)
         if prefer_cls is not None and (cl_all == prefer_cls).any():
             use_mask = (cl_all == prefer_cls)
@@ -693,7 +781,6 @@ class FoundationPoseTracker:
         sc_use = sc_all[use_mask]
         cl_use = cl_all[use_mask]
 
-        # IoU 計算
         ious = []
         for bb in xyxy_use:
             bb_clipped = self.clip_xyxy(bb, W, H)
@@ -710,7 +797,6 @@ class FoundationPoseTracker:
         best_cls = int(cl_use[best_idx])
         best_sc  = float(sc_use[best_idx])
 
-        # 更新並顯示本幀資訊 + 緩存
         self._last_yolo_text = f"YOLO det={len(xyxy_all)} best cls={best_cls} s={best_sc:.2f} IoU={iou_val:.3f}"
         cv2.putText(vis_bgr, self._last_yolo_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 1, cv2.LINE_AA)
 
@@ -718,49 +804,34 @@ class FoundationPoseTracker:
             rospy.loginfo(f"[IOU] frame={frame_count} best_iou={iou_val:.4f} (cls={best_cls}, score={best_sc:.3f})")
 
         return vis_bgr, iou_val
+
     # =========================
     # 姿態檢查工具
     # =========================
     def _model_up_vector_local(self):
-        """回傳模型『上』軸（在模型座標系）"""
         ax = self.pp_up_axis
         if ax == 'x': return np.array([1.0, 0.0, 0.0], dtype=np.float64)
         if ax == 'z': return np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        return np.array([0.0, 1.0, 0.0], dtype=np.float64)  # default 'y'
+        return np.array([0.0, 1.0, 0.0], dtype=np.float64) 
     
     def _orientation_ok(self, center_pose_cam: np.ndarray, origin_pose_cam: np.ndarray):
-        """
-        以『模型原點 vs 幾何中心』在影像中的上下關係判斷方向：
-        - 若 v_origin < v_center - tol → measured='upright'（原點更高）
-        - 若 v_origin > v_center + tol → measured='inverted'（原點更低）
-        - 否則 measured='neutral'（容許帶內）
-        與 pp_expect_orientation（upright/inverted）比對；在容許帶內視為通過。
-        回傳 (ok: bool, dv_px: float)，其中 dv_px = v_origin - v_center（>0 表示原點更低）
-        """
         if center_pose_cam is None or origin_pose_cam is None or self.K is None:
             return True, 0.0
 
-        # 取兩個點（相機座標系）
-        Xc, Yc, Zc = map(float, center_pose_cam[:3, 3])   # 幾何中心
-        Xo, Yo, Zo = map(float, origin_pose_cam[:3, 3])   # 模型原點
+        Xc, Yc, Zc = map(float, center_pose_cam[:3, 3])
+        Xo, Yo, Zo = map(float, origin_pose_cam[:3, 3])
         if Zc <= 1e-6 or Zo <= 1e-6:
             return True, 0.0
 
         fx, fy, cx, cy = float(self.K[0,0]), float(self.K[1,1]), float(self.K[0,2]), float(self.K[1,2])
-
-        # 投影成像素座標（只需要 v）
         vc = fy * (Yc / Zc) + cy
         vo = fy * (Yo / Zo) + cy
-
-        dv = float(vo - vc)  # >0: 原點在幾何中心『下方』；<0: 原點在上方
+        dv = float(vo - vc) 
         tol = float(self.pp_orient_center_tol_px)
 
-        if dv < -tol:
-            measured = "upright"    # 原點更高
-        elif dv > tol:
-            measured = "inverted"   # 原點更低
-        else:
-            measured = "neutral"    # 容許帶內
+        if dv < -tol: measured = "upright"
+        elif dv > tol: measured = "inverted"
+        else: measured = "neutral"
 
         expect = (self.pp_expect_orientation or "upright").strip().lower()
         if measured == "neutral":
@@ -771,29 +842,18 @@ class FoundationPoseTracker:
         return ok, dv
 
     def _size_ok(self, K: np.ndarray, color_bgr: np.ndarray, center_pose_cam: np.ndarray):
-        """
-        依設定檢查大小。
-        - size_mode='bbox_mm' ：以實際模型外框尺寸（mm）比較
-        - size_mode='depth'   ：以Z距離比較
-        回傳 (ok:bool, metric:float, metric_name:str)
-        """
         if center_pose_cam is None:
             return True, 0.0, "none"
 
-        # --- 模式1：使用物體實際大小（mm）
         if self.pp_size_mode == "bbox_mm":
-            # 模型在世界的外框尺寸（mm）
             expected_w = float(self.pp_expect_bbox_w_mm)
             expected_h = float(self.pp_expect_bbox_h_mm)
-            # 計算模型經當前姿態轉換後的空間長寬（mm）
             bbox_min, bbox_max = self.bbox
-            corners = np.array([[x, y, z, 1.0] for x in [bbox_min[0], bbox_max[0]]
-                                for y in [bbox_min[1], bbox_max[1]]
-                                for z in [bbox_min[2], bbox_max[2]]], dtype=np.float64)
-            world_pts = (center_pose_cam @ corners.T).T[:, :3] * 1000.0  # m→mm
+            corners = np.array([[x, y, z, 1.0] for x in [bbox_min[0], bbox_max[0]] for y in [bbox_min[1], bbox_max[1]] for z in [bbox_min[2], bbox_max[2]]], dtype=np.float64)
+            world_pts = (center_pose_cam @ corners.T).T[:, :3] * 1000.0
             diff = world_pts.max(axis=0) - world_pts.min(axis=0)
-            actual_w = float(np.linalg.norm(diff[[0, 2]]))  # x-z 平面長度當作寬
-            actual_h = float(abs(diff[1]))                 # y方向當作高
+            actual_w = float(np.linalg.norm(diff[[0, 2]]))
+            actual_h = float(abs(diff[1]))
 
             ok_w = (actual_w >= self.pp_size_ratio_min * expected_w)
             ok_h = (actual_h >= self.pp_size_ratio_min * expected_h)
@@ -801,54 +861,42 @@ class FoundationPoseTracker:
             metric = (float(actual_w), float(actual_h))
             return ok, metric, "bbox_mm>=min(w,h)"
 
-        # --- 模式2：深度距離
         if self.pp_size_mode == "depth":
             z = float(center_pose_cam[2, 3])
             ok = (abs(z - self.pp_expect_depth_m) <= self.pp_depth_tol_m)
             return ok, z, "depth_m"
 
-        # --- 其他模式關閉
         return True, 0.0, "none"
     
     def postprocess_and_maybe_reinit(self, color_bgr, K, pose_obj_in_cam: np.ndarray):
-        """
-        檢查方向與大小。
-        回傳 (ok_to_publish: bool, pending: bool)
-        - ok_to_publish=True  且 pending=False → 正常發布
-        - ok_to_publish=False 且 pending=True  → 進入延遲再確認，不發布
-        - 其他情況            → 由 spin() 決定（例如 pending 中持續等待）
-        """
         if not self.pp_enable:
             return True, False
 
-        center_pose = pose_obj_in_cam @ np.linalg.inv(self.to_origin)  # 幾何中心
-
+        center_pose = pose_obj_in_cam @ np.linalg.inv(self.to_origin)
         orient_ok, dv_px = self._orientation_ok(center_pose, pose_obj_in_cam)
         size_ok, metric_val, metric_name = self._size_ok(K, color_bgr, center_pose)
 
-        # log（metric 可能是 tuple 或 float）
         if isinstance(metric_val, (tuple, list, np.ndarray)) and len(metric_val) >= 2:
             metric_str = f"({float(metric_val[0]):.1f},{float(metric_val[1]):.1f})"
         else:
             metric_str = f"{float(metric_val):.3f}"
         rospy.loginfo_throttle(1.0, f"[POST] orient_ok={orient_ok} dv_px={dv_px:.1f} | size_ok={size_ok} {metric_name}={metric_str}")
-        # 通過 → 清除 pending
+        
         if orient_ok and size_ok:
             self._post_pending = False
             self._post_fail_time = None
             return True, False
 
-        # 不通過 → 若尚未 pending，開始計時；若已 pending，由 spin() 負責等時間/觸發 reinit
         if not self._post_pending:
             self._post_pending = True
             self._post_fail_time = rospy.Time.now()
             rospy.logwarn_throttle(1.0, f"[POST] Fail detected. Debounce for {self.pp_retry_delay_sec:.1f}s before reinit.")
         return False, True
+
     # =========================
     # ROS 轉換工具
     # =========================
     def mat4_to_translation_quat(self, T: np.ndarray):
-        """4x4 → (tx,ty,tz), (qx,qy,qz,qw)"""
         assert T.shape == (4, 4)
         t = (float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
         qx, qy, qz, qw = tf.transformations.quaternion_from_matrix(T)
@@ -856,7 +904,6 @@ class FoundationPoseTracker:
         return t, q
 
     def mat4_to_pose(self, T: np.ndarray) -> Pose:
-        """4x4 → geometry_msgs/Pose"""
         t, q = self.mat4_to_translation_quat(T)
         msg = Pose()
         msg.position.x, msg.position.y, msg.position.z = t
@@ -864,12 +911,9 @@ class FoundationPoseTracker:
         return msg
     
     def broadcast_transform_and_pose(self, transform: Transform, object_name: str, camera_tf: str):
-        # --- send TF (parent= camera_tf, child= object_name)
         t = (transform.translation.x, transform.translation.y, transform.translation.z)
         q = (transform.rotation.x, transform.rotation.y, transform.rotation.z, transform.rotation.w)
         self.tf_broadcaster.sendTransform(t, q, rospy.Time.now(), object_name, camera_tf)
-
-        # --- publish Pose on <object_name>
         pose = Pose()
         pose.position.x, pose.position.y, pose.position.z = t
         pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = q
@@ -877,14 +921,13 @@ class FoundationPoseTracker:
 
     def imageCallback(self, msg: Image):
         try:
-            # 轉成 BGR8
             img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as e:
             rospy.logwarn("rgb decode failed: %r", e)
             return
         self.color = img
         self.got_rgb = True
-        self.rgb_size = (img.shape[1], img.shape[0])  # (W, H)
+        self.rgb_size = (img.shape[1], img.shape[0])
 
     def infoCallback(self, msg: CameraInfo):
         self.info_msg = msg
@@ -901,17 +944,13 @@ class FoundationPoseTracker:
             rospy.logwarn("depth decode failed: %r", e)
             return
 
-        # 轉公尺（演算法用）
         if msg.encoding.upper() in ("16UC1", "TYPE_16UC1"):
-            depth_m = d * 0.001  # mm -> m
+            depth_m = d * 0.001 
         else:
-            # 可能已是 m；若最大值遠小於 10，視為 m；否則視為 mm
             depth_m = d if np.nanmax(d) <= 10.0 else d * 0.001
 
-        # 存給演算法
         self.depth_m = np.nan_to_num(depth_m, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # 另外做可視化彩圖（僅顯示）
         maxd_mm = max(1.0, float(self.max_depth_mm))
         depth_mm_for_vis = np.clip(self.depth_m * 1000.0, 0.0, maxd_mm)
         depth_8u = (depth_mm_for_vis * (255.0 / maxd_mm)).astype(np.uint8)
@@ -928,9 +967,9 @@ class FoundationPoseTracker:
         if msg.layer == 0.0:
             self.det_select_mode = "score"
         elif msg.layer == 1.0:
-            self.det_select_mode = "bottom"
+            self.det_select_mode = "nearest_depth"
         elif msg.layer == 2.0:
-            self.det_select_mode = "top"
+            self.det_select_mode = "middle"
         else:
             self.det_select_mode = "score"
 
@@ -948,7 +987,13 @@ class FoundationPoseTracker:
         self.ready_received = Detection()
         self.ready_received.detection_allowed = False
         self.ready_received.layer = 0.0
+        
         while not rospy.is_shutdown():
+            # 在每幀的一開始重置時間變數，確保若該階段沒跑，時間就會是 0
+            self.time_seg = 0.0
+            self.time_init = 0.0
+            self.time_refine = 0.0
+
             if not (self.got_depth and self.got_rgb and self.K is not None and hasattr(self, "depth_m")):
                 self.pump_windows(self.color if self.got_rgb else None, self.depth_vis if self.got_depth else None)
                 rospy.sleep(0.01)
@@ -960,18 +1005,15 @@ class FoundationPoseTracker:
                 self.iou_bad_count = 0
                 self.iou_val = None
 
-                # 視窗上顯示暫停提示
                 vis_rgb = self.color.copy() if self.color is not None else np.zeros((480,640,3), np.uint8)
                 cv2.putText(vis_rgb, "DETECTION DISABLED", (20, 40),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
                 self.pump_windows(vis_rgb if self.show_rgb_win else None,
                                 self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
 
-                # 發布信心為 0
                 self.confidence_publish(0.0, False)
                 continue
 
-            # 延遲再確認狀態：不做位姿估測，倒數到期才reinit
             if getattr(self, "_post_pending", False):
                 now = rospy.Time.now()
                 start_t = self._post_fail_time or now
@@ -986,91 +1028,89 @@ class FoundationPoseTracker:
                 self.confidence_publish(0.0, False)
 
                 if elapsed >= float(self.pp_retry_delay_sec):
-                    # 時間到 → 觸發 reinit 並清計時
                     rospy.logwarn("[POST] Debounce timeout reached. Reinit now.")
                     self._post_pending = False
                     self._post_fail_time = None
                     self.pose = None
                     first_frame = True
-                    # 直接進下一輪，不做任何估測
                 rospy.sleep(0.01)
                 continue
+                
             self.frame_count += 1
+            
             # === 初始化 ROI 階段 ===
             if self.init_mode == 'click':
-                # 點選流程
                 if selecting_bbox:
                     if not self.update_bbox_selection(self.color):
                         continue
                     else:
                         self.mask = self.create_mask(self.depth_m, box_points)
+                        
+                        t0 = time.perf_counter()
                         self.pose = self.est.register(K=self.K, rgb=self.color, depth=self.depth_m, ob_mask=self.mask, iteration=self.est_refine_iter)
+                        if self.perf_eval_enable: 
+                            self.time_init = (time.perf_counter() - t0) * 1000.0
+                            self.time_seg = 0.0 # 手動標註不計算AI推論時間
+                            
                         box_points.clear()
                         first_frame = False
                 elif first_frame:
                     self.select_bbox(self.color)
-                    continue  # 等點選完成
+                    continue 
             else:
-                # YOLO
+                # YOLO 初始化
                 if first_frame:
                     init = self.init_via_yolo_roi(self.detector, self.color, self.depth_m, self.K, self.est,
                                              self.est_refine_iter, self.roi_expand,
                                              self.det_imgsz, self.det_conf, self.prefer_cls)
                     if init[0] is None:
-                        continue  # 等到偵到為止
+                        continue 
                     self.pose, self.mask, _, _ = init
                     first_frame = False
 
             # === 追蹤 ===
+            t1 = time.perf_counter()
             self.pose = self.est.track_one(rgb=self.color, depth=self.depth_m, K=self.K, iteration=self.track_refine_iter)
+            if self.perf_eval_enable: 
+                self.time_refine = (time.perf_counter() - t1) * 1000.0
 
             vis_bgr = self.color.copy()
             if self.pose is not None:
-                # 後處理檢查（此版本回傳 ok_to_publish, pending）
                 ok_to_publish, pending = self.postprocess_and_maybe_reinit(self.color, self.K, self.pose)
 
-                # 若進入 pending：本幀不發布，下一輪最前面會顯示倒數並阻擋估測
                 if pending:
-                    cv2.putText(vis_bgr, "Post-check pending...", (10, 90),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-                    self.pump_windows(vis_bgr if self.show_rgb_win else None,
-                                      self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
+                    cv2.putText(vis_bgr, "Post-check pending...", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+                    self.pump_windows(vis_bgr if self.show_rgb_win else None, self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
                     self.confidence_publish(0.0, False)
                     continue
 
-                # 保險：若不允許發布（理論上不會到這），也跳過
                 if not ok_to_publish:
-                    cv2.putText(vis_bgr, "Re-init (postproc)", (10, 90),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+                    cv2.putText(vis_bgr, "Re-init (postproc)", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
                     first_frame = True
-                    self.pump_windows(vis_bgr if self.show_rgb_win else None,
-                                      self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
+                    self.pump_windows(vis_bgr if self.show_rgb_win else None, self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
                     self.confidence_publish(0.0, False)
                     continue
 
-                # 後處理通過 → 正常發布/可視化
                 center_pose = self.pose @ np.linalg.inv(self.to_origin)
                 color_rgb = cv2.cvtColor(self.color, cv2.COLOR_BGR2RGB)
-                # rospy.loginfo(f"pose={self.pose})")
-                # 將 4x4 轉成 geometry_msgs/Transform
+                
                 t, q = self.mat4_to_translation_quat(self.pose)
                 tr = Transform()
                 tr.translation.x, tr.translation.y, tr.translation.z = t
                 tr.rotation.x, tr.rotation.y, tr.rotation.z, tr.rotation.w = q
 
-                # 廣播 + 發布（topic = self.object_name, frame = self.camera_tf）
                 parent_frame = self.camera_tf if self.camera_tf else "camera_color_optical_frame"
                 self.broadcast_transform_and_pose(tr, self.object_name, parent_frame)
 
-                # 可視化
                 vis = draw_posed_3d_box(self.K, img=color_rgb, ob_in_cam=center_pose, bbox=self.bbox)
                 vis = draw_xyz_axis(vis, ob_in_cam=self.pose, scale=0.05, K=self.K, thickness=3, transparency=0, is_input_rgb=True)
                 vis_bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
+                
                 if self.iou_val is not None:
                     bar_w, bar_h, margin = 220, 18, 10
                     self.draw_conf_bar(vis_bgr,{"IoU": float(self.iou_val)},label="IoU",origin=(10, vis_bgr.shape[0] - margin - bar_h),size=(bar_w, bar_h),max_val=1.0)
+                
                 if self.init_mode == 'yolo':
-                    # === 每 N 幀做一次 YOLO vs. 估測框 IoU===
                     vis_bgr, _new_iou  = self.periodic_yolo_iou(
                         frame_count=self.frame_count, stride=self.iou_stride, detector=self.detector,
                         color=self.color, center_pose=center_pose, bbox_minmax=self.bbox, K=self.K,
@@ -1079,7 +1119,7 @@ class FoundationPoseTracker:
                     )
                     if _new_iou is not None:
                         self.iou_val = float(_new_iou) 
-                    # IoU 連續低於閾值則觸發重新流程
+                    
                     if self.iou_val is not None:
                         if self.iou_val < self.iou_thresh:
                             self.iou_bad_count += 1
@@ -1088,7 +1128,7 @@ class FoundationPoseTracker:
 
                         if self.iou_bad_count >= self.iou_patience:
                             self.iou_bad_count = 0
-                            first_frame = True    # 下一輪走初始化（依 init_mode 決定是 yolo 或 click）
+                            first_frame = True
                             self.pose = None
                             cv2.putText(vis_bgr, "Re-init (low IoU)", (10, 90),cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 1, cv2.LINE_AA)
 
@@ -1102,6 +1142,14 @@ class FoundationPoseTracker:
                 self.confidence_publish(float(self.iou_val), not first_frame)
             else:
                 self.confidence_publish(0.0, False)
+
+            # 新增：紀錄效能資料到 CSV (若為 0 則留空)
+            if self.perf_eval_enable and getattr(self, "perf_csv_path", None) is not None:
+                with open(self.perf_csv_path, mode='a', newline='') as f:
+                    writer = csv.writer(f)
+                    fmt = lambda t: round(t, 2) if t > 0 else ""
+                    writer.writerow([self.frame_count, fmt(self.time_seg), fmt(self.time_init), fmt(self.time_refine)])
+                
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":

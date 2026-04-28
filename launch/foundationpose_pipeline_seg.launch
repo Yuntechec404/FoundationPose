@@ -60,7 +60,8 @@
   <arg name="stem_depth_min" default="0.1" />
   <arg name="stem_depth_max" default="3.0" />
   <arg name="stem_assumed_radius" default="0.0" />
-  <arg name="max_dist_px" default="50" />
+  <arg name="max_jump_m" default="0.06" />
+  <arg name="ema_alpha" default="0.6" />
   <arg name="tracker_type" default="bytetrack.yaml"/> <!-- bytetrack.yaml | botsort.yaml -->
 
   <!-- 分類 id（你的資料集 class id） -->
@@ -71,8 +72,11 @@
   <arg name="policy_occ_thresh_high" default="0.7"/>
   <arg name="policy_high_patience" default="5"/>
 
-  <arg name="seg_backend" default="yolo_seg"/> <arg name="seg_model" default="$(find ros_foundationpose)/data/bunch_stem-seg.onnx"/>
-  <arg name="occ_seg_warmup_n" default="8"/> <node pkg="ros_foundationpose" type="pipeline_tracker_yoloseg.py" name="pipeline_tracker" output="screen">
+  <arg name="seg_backend" default="yolo_seg"/>
+  <arg name="seg_model" default="$(find ros_foundationpose)/data/bunch_stem-seg.onnx"/>
+  <arg name="occ_seg_warmup_n" default="8"/>
+  
+  <node pkg="ros_foundationpose" type="pipeline_tracker_yoloseg.py" name="pipeline_tracker" output="screen">
     <param name="image_topic" value="$(arg image_topic)"/>
     <param name="info_topic" value="$(arg info_topic)"/>
     <param name="depth_topic" value="$(arg depth_topic)"/>
@@ -128,7 +132,8 @@
     <param name="postproc/stem/stem_depth_min" value="$(arg stem_depth_min)" />
     <param name="postproc/stem/stem_depth_max" value="$(arg stem_depth_max)" />
     <param name="postproc/stem/stem_assumed_radius" value="$(arg stem_assumed_radius)" />
-    <param name="postproc/stem/max_dist_px" value="$(arg max_dist_px)" />
+    <param name="postproc/stem/max_jump_m" value="$(arg max_jump_m)" />
+    <param name="postproc/stem/ema_alpha" value="$(arg ema_alpha)" />
     <param name="tracker_type" value="$(arg tracker_type)"/>
 
     <param name="classes/bunch" value ="$(arg cls_bunch)"/>
