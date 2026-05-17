@@ -16,11 +16,11 @@ from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import Pose, PoseStamped, Transform
 from cv_bridge import CvBridge
 from forklift_msg.msg import Confidence, Detection
+from std_msgs.msg import Empty
 
 from collections import deque
 import tf
 
-# --- 第三方與專案路徑（依你的環境調整） ---
 sys.path.append('/home/user/anaconda3/envs/foundationpose/lib/python3.8/site-packages')
 FOUNDATIONPOSE_SRC = "/home/user/FoundationPose"
 if FOUNDATIONPOSE_SRC not in sys.path:
@@ -34,11 +34,10 @@ from ultralytics import YOLO, SAM, FastSAM
 selecting_bbox = False
 box_points = []
 
-class FoundationPoseTracker:
+class FoundationPoseTrackerBenchmark:
     def __init__(self):
         self.init_parameter()
         
-        # 決定要記錄的模型名稱
         self.det_model_name = os.path.basename(self.det_model)
         if self.seg_backend in ['sam', 'sam2', 'fastsam']:
             self.seg_model_name = f"{self.seg_backend}_{os.path.basename(self.sam_ckpt)}"
@@ -47,10 +46,8 @@ class FoundationPoseTracker:
         else:
             self.seg_model_name = self.seg_backend
             
-        # 建立時間戳 debug 資料夾
         self._setup_run_debug_dir()
         
-        # 初始化 CSV 效能紀錄檔
         if self.perf_eval_enable and self.debug_dir:
             self.perf_csv_path = os.path.join(self.debug_dir, "perf_eval.csv")
             with open(self.perf_csv_path, mode='w', newline='') as f:
@@ -79,16 +76,13 @@ class FoundationPoseTracker:
         self.K = None
         self._last_yolo_text = ""
         
-        # 連續穩定偵測計數器
         self.consecutive_det_count = 0
 
-        # 效能分析數據 (ms) 
         self.time_det = 0.0  
         self.time_seg = 0.0  
         self.time_init = 0.0 
         self.time_refine = 0.0 
         
-        # 效能分析快取數據 
         self.ui_time_det = 0.0 
         self.ui_time_seg = 0.0
         self.ui_time_init = 0.0
@@ -103,6 +97,10 @@ class FoundationPoseTracker:
 
         self._post_pending = False  
         self._post_fail_time = None 
+
+        self.tracking_start_time = None
+        self.track_save_count = 0        
+        self.first_track_saved = False 
 
         # Pub/Sub
         self.image_sub = rospy.Subscriber(self.image_topic, Image, self.imageCallback, queue_size=1)
@@ -147,13 +145,14 @@ class FoundationPoseTracker:
         self.detector, self.det_device = self.load_detector(self.det_model, task=task_type)
         is_gpu, yolo_desc = self.yolo_uses_gpu(self.detector)
         rospy.loginfo(f"[YOLO] GPU enabled: {is_gpu}  ({yolo_desc})")
-        rospy.loginfo(f"[YOLO] predict device hint: {self.det_device}")
-        rospy.loginfo("Detector initialization done")
-
-        # SAM / SAM2 / FastSAM 的載入
+        
+        # ==========================================
+        # SAM / SAM2 / FastSAM 的載入邏輯
+        # ==========================================
         self.prompt_model = None
         if self.seg_backend in ['sam', 'sam2', 'fastsam']:
             try:
+                # FastSAM 和 SAM/SAM2 在 Ultralytics 使用的 Class 稍微不同，但 API 相同
                 if self.seg_backend == 'fastsam':
                     self.prompt_model = FastSAM(self.sam_ckpt)
                 else:
@@ -161,13 +160,13 @@ class FoundationPoseTracker:
                     
                 rospy.loginfo(f"[{self.seg_backend.upper()}] Loaded {self.sam_ckpt}")
                 dummy = np.zeros((self.det_imgsz, self.det_imgsz, 3), np.uint8)
+                # 統一預熱
                 _ = self.prompt_model(dummy, bboxes=[[10,10,100,100]], imgsz=self.det_imgsz, device="cuda:0" if torch.cuda.is_available() else "cpu", verbose=False)
             except Exception as e:
                 rospy.logwarn(f"[{self.seg_backend.upper()}] init failed: {e}")
                 self.prompt_model = None
 
     def init_parameter(self):
-        # 參數
         ns = rospy.get_name()
         gp = lambda k, d: rospy.get_param(ns + "/" + k, d)
 
@@ -184,9 +183,7 @@ class FoundationPoseTracker:
         self.yolo_start_mode = gp("yolo_start_mode", "immediate").strip().lower()
         self.det_conf = float(gp("det_conf", 0.25))
         self.det_class = int(gp("det_class", -1))
-        
-        self.init_det_patience = int(gp("init_det_patience", 5))
-        
+        self.init_det_patience = int(gp("init_det_patience", 3))
         self.est_refine_iter = int(gp("est_refine_iter", 5))
         self.track_refine_iter = int(gp("track_refine_iter", 2))
         
@@ -206,7 +203,6 @@ class FoundationPoseTracker:
 
         self.det_select_mode = gp("det_select_mode", "score").strip().lower()
         if self.det_select_mode not in ("score", "middle", "nearest_depth"):
-            rospy.logwarn("Unknown det_select_mode=%s, fallback to 'score'", self.det_select_mode)
             self.det_select_mode = "score"
 
         self.show_depth_win = bool(gp("show_depth_window", False))
@@ -215,7 +211,6 @@ class FoundationPoseTracker:
         self.rgb_win_name = gp("rgb_win_name", "RGB Image")
         self.depth_win_xy = gp("depth_window_xy", [100, 100])  
         self.rgb_win_xy = gp("rgb_window_xy", [100, 500])  
-
         self.max_depth_mm = float(gp("max_depth_mm", 10000.0))  
         self.colormap_id = int(gp("colormap", int(cv2.COLORMAP_JET)))  
         self.invert_colormap = bool(gp("invert_colormap", False))
@@ -233,17 +228,12 @@ class FoundationPoseTracker:
         self.pp_retry_delay_sec = float(gp("postproc/retry_delay_sec", 1.0))
         self.pp_on_fail = gp("postproc/on_fail", "reinit").strip().lower()
 
-    # =========================
-    # Debug 資料夾與路徑工具
-    # =========================
     def _setup_run_debug_dir(self):
         if not self.perf_eval_enable:
             self.debug_dir = None
-            rospy.loginfo("[DBG] perf_eval_enable is false. Debug directory will NOT be created.")
             return
-
         root = getattr(self, "debug_root", None) or getattr(self, "debug_dir", "/tmp/fp_debug")
-        ts = datetime.now().strftime("%Y%m%d-%H%M_tracker")
+        ts = datetime.now().strftime("%Y%m%d-%H%M_benchmark")
         base = os.path.join(root, ts)
         run_dir = base
         k = 1
@@ -252,36 +242,29 @@ class FoundationPoseTracker:
             k += 1
         self.debug_dir = run_dir
         os.makedirs(self.debug_dir, exist_ok=True)
-        rospy.loginfo(f"[DBG] debug_dir (this run) = {self.debug_dir}")
 
     def _ensure_dir(self, d=None):
-        """確保目錄存在，若無則建立。"""
         if d is None: d = getattr(self, "debug_dir", None)
         if not d: return
         try: os.makedirs(d, exist_ok=True)
         except Exception: pass
 
     def _ensure_parent(self, path: str):
-        """確保檔案的上層目錄存在，若無則建立。"""
         try:
             parent = os.path.dirname(path)
             if parent: os.makedirs(parent, exist_ok=True)
         except Exception: pass
 
     def yolo_backend_info(self,detector):
-        """回傳 (engine, torch_device, ort_providers) 三項資訊，涵蓋 .pt/.onnx/等"""
         info = {"engine": None, "torch_device": None, "ort_providers": None}
         m = getattr(detector, "model", None)
-        if m is None:
-            return info
+        if m is None: return info
         info["engine"] = str(getattr(m, "backend", getattr(m, "engine", "")))
         try:
             if hasattr(m, "parameters"):
                 p = next(m.parameters(), None)
-                if p is not None:
-                    info["torch_device"] = str(p.device)
-        except Exception:
-            pass
+                if p is not None: info["torch_device"] = str(p.device)
+        except Exception: pass
         sess = None
         for attr in ("session", "ort_session", "session_ort"):
             s = getattr(m, attr, None)
@@ -289,34 +272,27 @@ class FoundationPoseTracker:
                 sess = s
                 break
         if sess is not None:
-            try:
-                info["ort_providers"] = list(sess.get_providers())
-            except Exception:
-                pass
+            try: info["ort_providers"] = list(sess.get_providers())
+            except Exception: pass
         else:
             prov = getattr(m, "providers", None)
-            if prov is not None:
-                info["ort_providers"] = list(prov)
+            if prov is not None: info["ort_providers"] = list(prov)
         return info
 
     def yolo_uses_gpu(self,detector):
-        """回傳 (is_gpu: bool, 描述字串)"""
         info = self.yolo_backend_info(detector)
         eng = (info["engine"] or "").lower()
         dev = (info["torch_device"] or "").lower()
         prov = info["ort_providers"] or []
         if any("CUDAExecutionProvider" == p for p in prov):
             return True, f"engine={eng or 'onnxruntime'} providers={prov}"
-        if "tensorrt" in eng:
-            return True, f"engine={eng}"
-        if dev.startswith("cuda"):
-            return True, f"engine={eng or 'pytorch'} device={dev}"
+        if "tensorrt" in eng: return True, f"engine={eng}"
+        if dev.startswith("cuda"): return True, f"engine={eng or 'pytorch'} device={dev}"
         return False, f"engine={eng or 'unknown'} providers={prov or 'None'} device={dev or 'None'}"
 
     def load_detector(self, model_path: str, task='detect'):
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"detector model not found: {model_path}")
-
         def _onnx_sibling(p):
             stem, ext = os.path.splitext(p)
             return stem + ".onnx"
@@ -325,38 +301,28 @@ class FoundationPoseTracker:
         det_device = "cpu"
 
         if ext == ".pt":
-            rospy.loginfo(f"[YOLO Loader] Loading PyTorch (.pt): {model_path}")
             try:
                 det = YOLO(model_path, task=task)
                 if torch.cuda.is_available():
                     try:
                         det.to("cuda:0")
                         det_device = 0 
-                        rospy.loginfo("[YOLO Loader] PT on GPU OK")
                         return det, det_device
-                    except Exception as ge:
-                        rospy.logwarn(f"[YOLO Loader] PT move to GPU failed: {ge}. Will try PT on CPU.")
-                else:
-                    rospy.logwarn("[YOLO Loader] No CUDA available; PT will run on CPU.")
+                    except Exception as ge: pass
                 try:
                     det.to("cpu")
                     det_device = "cpu"
-                    rospy.loginfo("[YOLO Loader] PT on CPU OK")
                     return det, det_device
-                except Exception as ce:
-                    rospy.logwarn(f"[YOLO Loader] PT on CPU failed: {ce}")
-            except Exception as e:
-                rospy.logwarn(f"[YOLO Loader] PT load failed: {e}")
+                except Exception as ce: pass
+            except Exception as e: pass
 
             onnx_fallback = _onnx_sibling(model_path)
             if os.path.isfile(onnx_fallback):
-                rospy.loginfo(f"[YOLO Loader] Trying fallback ONNX: {onnx_fallback}")
                 det, det_device = self._load_onnx_with_gpu_fallback(onnx_fallback, task=task)
                 return det, det_device
             else:
                 raise RuntimeError(f"Failed to load PT '{model_path}' and no sibling ONNX found.")
         elif ext == ".onnx":
-            rospy.loginfo(f"[YOLO Loader] Loading ONNX: {model_path}")
             det, det_device = self._load_onnx_with_gpu_fallback(model_path, task=task)
             return det, det_device
         else:
@@ -377,43 +343,28 @@ class FoundationPoseTracker:
             except Exception:
                 provs = []
             if "CUDAExecutionProvider" in provs:
-                rospy.loginfo(f"[YOLO Loader] ONNX providers={provs} (GPU OK)")
                 det_device = "cuda(ORT)"
                 return det, det_device
             try:
                 sess.set_providers(["CUDAExecutionProvider", "CPUExecutionProvider"])
                 provs2 = list(sess.get_providers())
                 if "CUDAExecutionProvider" in provs2:
-                    rospy.loginfo(f"[YOLO Loader] ONNX switched to providers={provs2} (GPU OK)")
                     det_device = "cuda(ORT)"
                     return det, det_device
-                else:
-                    rospy.logwarn(f"[YOLO Loader] ONNX CUDA provider not available, using CPU providers={provs2}")
-            except Exception as ge:
-                rospy.logwarn(f"[YOLO Loader] ONNX set_providers to CUDA failed: {ge}.")
-            try:
-                sess.set_providers(["CPUExecutionProvider"])
-            except Exception:
-                pass
-            rospy.loginfo("[YOLO Loader] ONNX on CPUExecutionProvider")
+            except Exception as ge: pass
+            try: sess.set_providers(["CPUExecutionProvider"])
+            except Exception: pass
             det_device = "cpu(ORT)"
             return det, det_device
-
-        rospy.logwarn("[YOLO Loader] ONNX session not exposed; provider control skipped.")
         return det, det_device
 
-    # =========================
-    # 偵測 / BBox / 幾何工具
-    # =========================
     def clip_xyxy(self, xyxy, W, H):
-        if xyxy is None:
-            return None
+        if xyxy is None: return None
         x1, y1, x2, y2 = map(float, xyxy)
         return np.array([max(0, x1), max(0, y1), min(W - 1, x2), min(H - 1, y2)], dtype=np.float32)
 
     def rect_to_mask(self, depth, xyxy, expand=0.0):
-        if xyxy is None:
-            return None
+        if xyxy is None: return None
         H, W = depth.shape[:2]
         x1, y1, x2, y2 = xyxy.astype(np.int32)
         w, h = max(1, x2 - x1), max(1, y2 - y1)
@@ -426,8 +377,7 @@ class FoundationPoseTracker:
         return m
 
     def iou_xyxy(self, a, b):
-        if a is None or b is None:
-            return 0.0
+        if a is None or b is None: return 0.0
         x1 = max(a[0], b[0])
         y1 = max(a[1], b[1])
         x2 = min(a[2], b[2])
@@ -440,9 +390,6 @@ class FoundationPoseTracker:
         return float(inter / (ua + ub - inter + 1e-6))
 
     def yolo_det_xyxy_mask(self, detector: YOLO, img_bgr, imgsz=640, conf=0.25, prefer_cls=None, mode="score"):
-        """
-        回傳單一最佳目標的 (xyxy, score, cls, mask_data)
-        """
         t0 = time.perf_counter()
         r = detector.predict(source=img_bgr, imgsz=imgsz, conf=conf, device=self.det_device, verbose=False)[0]
         if self.perf_eval_enable: 
@@ -462,12 +409,10 @@ class FoundationPoseTracker:
         masks = r.masks.data.cpu().numpy() if r.masks is not None else None
 
         mask = (sc >= float(conf))
-        if prefer_cls is not None:
-            mask = mask & (cl == int(prefer_cls))
+        if prefer_cls is not None: mask = mask & (cl == int(prefer_cls))
 
         idxs = np.where(mask)[0]
-        if idxs.size == 0:
-            return None, 0.0, None, None
+        if idxs.size == 0: return None, 0.0, None, None
 
         mode = (mode or "score").lower()
         H, W = img_bgr.shape[:2]
@@ -478,25 +423,20 @@ class FoundationPoseTracker:
             centers_y = (xyxy[idxs, 1] + xyxy[idxs, 3]) / 2.0
             dists = (centers_x - cx_img)**2 + (centers_y - cy_img)**2
             pick = idxs[np.argmin(dists)]
-            
         elif mode == "nearest_depth" and hasattr(self, "depth_m"):
             min_depth = float('inf')
             pick = idxs[0] 
-            
             temp_depth = self.depth_m.copy()
             temp_depth[temp_depth == 0] = np.max(temp_depth)
             temp_depth = cv2.GaussianBlur(temp_depth, (3, 3), 0)
-            
             for idx in idxs:
                 if masks is not None:
                     m = masks[idx]
-                    if m.shape != (H, W):
-                        m = cv2.resize(m.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
+                    if m.shape != (H, W): m = cv2.resize(m.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
                     v_inst, u_inst = np.where(m > 0)
                 else:
                     m = self.rect_to_mask(temp_depth, xyxy[idx])
                     v_inst, u_inst = np.where(m > 0)
-                    
                 if len(v_inst) > 0:
                     z_vals = temp_depth[v_inst, u_inst]
                     valid_z = z_vals[(z_vals > 0.1) & (z_vals < 5.0)]
@@ -505,8 +445,7 @@ class FoundationPoseTracker:
                         if med_z < min_depth:
                             min_depth = med_z
                             pick = idx
-
-        else: # Default is "score"
+        else: 
             pick = idxs[np.argmax(sc[idxs])]
 
         target_mask = masks[pick] if masks is not None else None
@@ -540,32 +479,28 @@ class FoundationPoseTracker:
         Pc = (center_pose @ corners.T).T
         Z = Pc[:, 2]
         valid = Z > 1e-6
-        if not np.any(valid):
-            return None
+        if not np.any(valid): return None
         X = Pc[valid, 0] / Z[valid]
         Y = Pc[valid, 1] / Z[valid]
         u = K[0, 0] * X + K[0, 2]
         v = K[1, 1] * Y + K[1, 2]
         return self.clip_xyxy(np.array([u.min(), v.min(), u.max(), v.max()], dtype=np.float32), W, H)
 
-    # =========================
-    # Segmentation 邏輯整合
-    # =========================
     def get_segmentation_mask(self, color, depth, xyxy, yolo_mask_data=None):
-        """根據參數產生最終註冊用的 Mask"""
         H, W = color.shape[:2]
-        if xyxy is None:
-            return np.zeros((H, W), dtype=bool)
+        if xyxy is None: return np.zeros((H, W), dtype=bool)
 
         x1, y1, x2, y2 = self.clip_xyxy(xyxy, W, H).astype(int)
 
         if self.seg_backend == 'yolo11-seg' and yolo_mask_data is not None:
             if yolo_mask_data.shape != (H, W):
                 mask = cv2.resize(yolo_mask_data.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
-            else:
-                mask = yolo_mask_data
+            else: mask = yolo_mask_data
             return mask.astype(bool)
 
+        # ==========================================
+        # 統一呼叫 SAM / SAM2 / FastSAM
+        # ==========================================
         elif self.seg_backend in ['sam', 'sam2', 'fastsam'] and self.prompt_model is not None:
             t0 = time.perf_counter()
             results = self.prompt_model(color, bboxes=[[int(x1), int(y1), int(x2), int(y2)]], imgsz=self.det_imgsz, device="cuda:0" if torch.cuda.is_available() else "cpu", verbose=False)
@@ -574,36 +509,24 @@ class FoundationPoseTracker:
             
             if results and results[0].masks is not None:
                 m = results[0].masks.data
-                if torch.is_tensor(m):
-                    m = m.detach().cpu().numpy()
+                if torch.is_tensor(m): m = m.detach().cpu().numpy()
                 m = np.asarray(m)
-                
-                if m.ndim == 3:
-                    m2 = m[0]
-                else:
-                    m2 = m
-                
-                if m2.shape != (H, W):
-                    m2 = cv2.resize(m2.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
+                if m.ndim == 3: m2 = m[0]
+                else: m2 = m
+                if m2.shape != (H, W): m2 = cv2.resize(m2.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST)
                 return (m2 > 0).astype(bool)
 
         if self.perf_eval_enable and self.seg_backend == 'bbox':
             self.time_seg = 0.0
         return self.rect_to_mask(depth, xyxy, expand=self.roi_expand)
 
-    # =========================
-    # 滑鼠點選ROI
-    # =========================
     def _open_window(self, name, pos_xy, init_size, is_rgb=True):
         w, h = init_size
-        try:
-            cv2.destroyWindow(name)
-        except Exception:
-            pass
+        try: cv2.destroyWindow(name)
+        except Exception: pass
         cv2.namedWindow(name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(name, int(w), int(h))
         cv2.moveWindow(name, int(pos_xy[0]), int(pos_xy[1]))
-
         if is_rgb:
             self._rgb_win_created = True
             self._rgb_win_sized = False
@@ -631,7 +554,6 @@ class FoundationPoseTracker:
             depth_frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
         if self.show_rgb_win and rgb_frame is not None:
-            # 加上效能分析字樣，並更新 cache 變數（僅當大於 0 時更新，避免跳動成 0）
             if self.perf_eval_enable:
                 if getattr(self, 'time_det', 0) > 0: self.ui_time_det = self.time_det
                 if getattr(self, 'time_seg', 0) > 0: self.ui_time_seg = self.time_seg
@@ -658,8 +580,7 @@ class FoundationPoseTracker:
                 self._depth_win_sized = True
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            rospy.signal_shutdown("user quit")
+        if key == ord('q'): rospy.signal_shutdown("user quit")
 
     def click_bbox(self, event, x, y, flags, param):
         global box_points
@@ -675,21 +596,16 @@ class FoundationPoseTracker:
 
     def update_bbox_selection(self, color):
         global box_points, selecting_bbox
-        if not selecting_bbox:
-            return True
-
+        if not selecting_bbox: return True
         if len(box_points) < 1:
             display_img = color.copy()
             self.pump_windows(display_img, self.depth_vis if self.got_depth else None)
             return False
-
         elif len(box_points) < 2:
             display_img = color.copy()
-            for pt in box_points:
-                cv2.circle(display_img, pt, radius=5, color=(0, 255, 0), thickness=-1)
+            for pt in box_points: cv2.circle(display_img, pt, radius=5, color=(0, 255, 0), thickness=-1)
             self.pump_windows(display_img, self.depth_vis if self.got_depth else None)
             return False
-
         else:
             selecting_bbox = False
             return True
@@ -774,8 +690,7 @@ class FoundationPoseTracker:
             return vis_bgr, 0.0
 
         use_mask = np.ones(len(xyxy_all), dtype=bool)
-        if prefer_cls is not None and (cl_all == prefer_cls).any():
-            use_mask = (cl_all == prefer_cls)
+        if prefer_cls is not None and (cl_all == prefer_cls).any(): use_mask = (cl_all == prefer_cls)
 
         xyxy_use = xyxy_all[use_mask]
         sc_use = sc_all[use_mask]
@@ -799,15 +714,8 @@ class FoundationPoseTracker:
 
         self._last_yolo_text = f"YOLO det={len(xyxy_all)} best cls={best_cls} s={best_sc:.2f} IoU={iou_val:.3f}"
         cv2.putText(vis_bgr, self._last_yolo_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 1, cv2.LINE_AA)
-
-        if log:
-            rospy.loginfo(f"[IOU] frame={frame_count} best_iou={iou_val:.4f} (cls={best_cls}, score={best_sc:.3f})")
-
         return vis_bgr, iou_val
 
-    # =========================
-    # 姿態檢查工具
-    # =========================
     def _model_up_vector_local(self):
         ax = self.pp_up_axis
         if ax == 'x': return np.array([1.0, 0.0, 0.0], dtype=np.float64)
@@ -815,36 +723,25 @@ class FoundationPoseTracker:
         return np.array([0.0, 1.0, 0.0], dtype=np.float64) 
     
     def _orientation_ok(self, center_pose_cam: np.ndarray, origin_pose_cam: np.ndarray):
-        if center_pose_cam is None or origin_pose_cam is None or self.K is None:
-            return True, 0.0
-
+        if center_pose_cam is None or origin_pose_cam is None or self.K is None: return True, 0.0
         Xc, Yc, Zc = map(float, center_pose_cam[:3, 3])
         Xo, Yo, Zo = map(float, origin_pose_cam[:3, 3])
-        if Zc <= 1e-6 or Zo <= 1e-6:
-            return True, 0.0
-
+        if Zc <= 1e-6 or Zo <= 1e-6: return True, 0.0
         fx, fy, cx, cy = float(self.K[0,0]), float(self.K[1,1]), float(self.K[0,2]), float(self.K[1,2])
         vc = fy * (Yc / Zc) + cy
         vo = fy * (Yo / Zo) + cy
         dv = float(vo - vc) 
         tol = float(self.pp_orient_center_tol_px)
-
         if dv < -tol: measured = "upright"
         elif dv > tol: measured = "inverted"
         else: measured = "neutral"
-
         expect = (self.pp_expect_orientation or "upright").strip().lower()
-        if measured == "neutral":
-            ok = True
-        else:
-            ok = (measured == expect)
-
+        if measured == "neutral": ok = True
+        else: ok = (measured == expect)
         return ok, dv
 
     def _size_ok(self, K: np.ndarray, color_bgr: np.ndarray, center_pose_cam: np.ndarray):
-        if center_pose_cam is None:
-            return True, 0.0, "none"
-
+        if center_pose_cam is None: return True, 0.0, "none"
         if self.pp_size_mode == "bbox_mm":
             expected_w = float(self.pp_expect_bbox_w_mm)
             expected_h = float(self.pp_expect_bbox_h_mm)
@@ -854,48 +751,31 @@ class FoundationPoseTracker:
             diff = world_pts.max(axis=0) - world_pts.min(axis=0)
             actual_w = float(np.linalg.norm(diff[[0, 2]]))
             actual_h = float(abs(diff[1]))
-
             ok_w = (actual_w >= self.pp_size_ratio_min * expected_w)
             ok_h = (actual_h >= self.pp_size_ratio_min * expected_h)
             ok = ok_w and ok_h
             metric = (float(actual_w), float(actual_h))
             return ok, metric, "bbox_mm>=min(w,h)"
-
         if self.pp_size_mode == "depth":
             z = float(center_pose_cam[2, 3])
             ok = (abs(z - self.pp_expect_depth_m) <= self.pp_depth_tol_m)
             return ok, z, "depth_m"
-
         return True, 0.0, "none"
     
     def postprocess_and_maybe_reinit(self, color_bgr, K, pose_obj_in_cam: np.ndarray):
-        if not self.pp_enable:
-            return True, False
-
+        if not self.pp_enable: return True, False
         center_pose = pose_obj_in_cam @ np.linalg.inv(self.to_origin)
         orient_ok, dv_px = self._orientation_ok(center_pose, pose_obj_in_cam)
         size_ok, metric_val, metric_name = self._size_ok(K, color_bgr, center_pose)
-
-        if isinstance(metric_val, (tuple, list, np.ndarray)) and len(metric_val) >= 2:
-            metric_str = f"({float(metric_val[0]):.1f},{float(metric_val[1]):.1f})"
-        else:
-            metric_str = f"{float(metric_val):.3f}"
-        rospy.loginfo_throttle(1.0, f"[POST] orient_ok={orient_ok} dv_px={dv_px:.1f} | size_ok={size_ok} {metric_name}={metric_str}")
-        
         if orient_ok and size_ok:
             self._post_pending = False
             self._post_fail_time = None
             return True, False
-
         if not self._post_pending:
             self._post_pending = True
             self._post_fail_time = rospy.Time.now()
-            rospy.logwarn_throttle(1.0, f"[POST] Fail detected. Debounce for {self.pp_retry_delay_sec:.1f}s before reinit.")
         return False, True
 
-    # =========================
-    # ROS 轉換工具
-    # =========================
     def mat4_to_translation_quat(self, T: np.ndarray):
         assert T.shape == (4, 4)
         t = (float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
@@ -922,9 +802,7 @@ class FoundationPoseTracker:
     def imageCallback(self, msg: Image):
         try:
             img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        except Exception as e:
-            rospy.logwarn("rgb decode failed: %r", e)
-            return
+        except Exception as e: return
         self.color = img
         self.got_rgb = True
         self.rgb_size = (img.shape[1], img.shape[0])
@@ -938,24 +816,17 @@ class FoundationPoseTracker:
 
     def depthCallback(self, msg: Image):
         self.depth_encoding = msg.encoding
-        try:
-            d = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough").astype(np.float32)
-        except Exception as e:
-            rospy.logwarn("depth decode failed: %r", e)
-            return
+        try: d = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough").astype(np.float32)
+        except Exception as e: return
 
-        if msg.encoding.upper() in ("16UC1", "TYPE_16UC1"):
-            depth_m = d * 0.001 
-        else:
-            depth_m = d if np.nanmax(d) <= 10.0 else d * 0.001
-
+        if msg.encoding.upper() in ("16UC1", "TYPE_16UC1"): depth_m = d * 0.001 
+        else: depth_m = d if np.nanmax(d) <= 10.0 else d * 0.001
         self.depth_m = np.nan_to_num(depth_m, nan=0.0, posinf=0.0, neginf=0.0)
 
         maxd_mm = max(1.0, float(self.max_depth_mm))
         depth_mm_for_vis = np.clip(self.depth_m * 1000.0, 0.0, maxd_mm)
         depth_8u = (depth_mm_for_vis * (255.0 / maxd_mm)).astype(np.uint8)
-        if self.invert_colormap:
-            depth_8u = 255 - depth_8u
+        if self.invert_colormap: depth_8u = 255 - depth_8u
         self.depth_vis = cv2.applyColorMap(depth_8u, self.colormap_id)
 
         self.got_depth = True
@@ -964,14 +835,10 @@ class FoundationPoseTracker:
     def detectionCallback(self, msg: Detection):
         self.ready_received.detection_allowed = msg.detection_allowed
         self.ready_received.layer = msg.layer
-        if msg.layer == 0.0:
-            self.det_select_mode = "score"
-        elif msg.layer == 1.0:
-            self.det_select_mode = "nearest_depth"
-        elif msg.layer == 2.0:
-            self.det_select_mode = "middle"
-        else:
-            self.det_select_mode = "score"
+        if msg.layer == 0.0: self.det_select_mode = "score"
+        elif msg.layer == 1.0: self.det_select_mode = "nearest_depth"
+        elif msg.layer == 2.0: self.det_select_mode = "middle"
+        else: self.det_select_mode = "score"
 
     def confidence_publish(self, score: float, detection: bool):
         conf_msg = Confidence()
@@ -1003,14 +870,13 @@ class FoundationPoseTracker:
                 self.pose = None
                 first_frame = True
                 self.consecutive_det_count = 0 
+                self.tracking_start_time = None
                 self.iou_bad_count = 0
                 self.iou_val = None
 
                 vis_rgb = self.color.copy() if self.color is not None else np.zeros((480,640,3), np.uint8)
-                cv2.putText(vis_rgb, "DETECTION DISABLED", (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-                self.pump_windows(vis_rgb if self.show_rgb_win else None,
-                                self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
+                cv2.putText(vis_rgb, "DETECTION DISABLED", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+                self.pump_windows(vis_rgb if self.show_rgb_win else None, self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
 
                 self.confidence_publish(0.0, False)
                 continue
@@ -1022,46 +888,39 @@ class FoundationPoseTracker:
                 remaining = max(0.0, float(self.pp_retry_delay_sec) - elapsed)
 
                 vis_rgb = self.color.copy() if self.color is not None else np.zeros((480,640,3), np.uint8)
-                cv2.putText(vis_rgb, f"Post-check pending... reinit in {remaining:.1f}s",
-                            (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
-                self.pump_windows(vis_rgb if self.show_rgb_win else None,
-                                  self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
+                cv2.putText(vis_rgb, f"Post-check pending... reinit in {remaining:.1f}s", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+                self.pump_windows(vis_rgb if self.show_rgb_win else None, self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
                 self.confidence_publish(0.0, False)
 
                 if elapsed >= float(self.pp_retry_delay_sec):
-                    rospy.logwarn("[POST] Debounce timeout reached. Reinit now.")
                     self._post_pending = False
                     self._post_fail_time = None
                     self.pose = None
                     first_frame = True
                     self.consecutive_det_count = 0  
+                    self.tracking_start_time = None
                 rospy.sleep(0.01)
                 continue
                 
             self.frame_count += 1
             
-            # === 初始化 ROI 階段 ===
             if self.init_mode == 'click':
                 if selecting_bbox:
-                    if not self.update_bbox_selection(self.color):
-                        continue
+                    if not self.update_bbox_selection(self.color): continue
                     else:
                         self.mask = self.create_mask(self.depth_m, box_points)
-                        
                         t0 = time.perf_counter()
                         self.pose = self.est.register(K=self.K, rgb=self.color, depth=self.depth_m, ob_mask=self.mask, iteration=self.est_refine_iter)
                         if self.perf_eval_enable: 
                             self.time_init = (time.perf_counter() - t0) * 1000.0
                             self.time_det = 0.0
                             self.time_seg = 0.0 
-                            
                         box_points.clear()
                         first_frame = False
                 elif first_frame:
                     self.select_bbox(self.color)
                     continue 
             else:
-                # YOLO 初始化
                 if first_frame:
                     self.consecutive_det_count += 1
                     do_register = (self.consecutive_det_count >= self.init_det_patience)
@@ -1081,9 +940,28 @@ class FoundationPoseTracker:
                     elif init[0] == "locking":
                         continue
                         
-                    self.pose, self.mask, _, _ = init
+                    # 獲取 BBox 數據
+                    self.pose, self.mask, det_xyxy, det_score = init
+                    
+                    # 儲存第一幀的 BBox 與 Seg 影像
+                    if self.perf_eval_enable and self.mask is not None and self.debug_dir:
+                        timestamp_str = datetime.now().strftime("%H%M%S")
+                        cycle_idx = self.track_save_count + 1
+                        
+                        # 1. 存 BBox
+                        bbox_img = self.color.copy()
+                        if det_xyxy is not None:
+                            x1, y1, x2, y2 = det_xyxy.astype(int)
+                            cv2.rectangle(bbox_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.imwrite(os.path.join(self.debug_dir, f"cycle{cycle_idx}_bbox_{timestamp_str}.jpg"), bbox_img)
+                        
+                        # 2. 存 Segmentation
+                        seg_img = self.color.copy()
+                        seg_img[self.mask > 0] = [0, 255, 0]
+                        cv2.imwrite(os.path.join(self.debug_dir, f"cycle{cycle_idx}_seg_{timestamp_str}.jpg"), seg_img)
+
                     first_frame = False
-                    self.consecutive_det_count = 0  
+                    self.consecutive_det_count = 0
 
             # === 追蹤 ===
             t1 = time.perf_counter()
@@ -1102,9 +980,9 @@ class FoundationPoseTracker:
                     continue
 
                 if not ok_to_publish:
-                    cv2.putText(vis_bgr, "Re-init (postproc)", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
                     first_frame = True
                     self.consecutive_det_count = 0  
+                    self.tracking_start_time = None
                     self.pump_windows(vis_bgr if self.show_rgb_win else None, self.depth_vis if (self.show_depth_win and hasattr(self, "depth_vis")) else None)
                     self.confidence_publish(0.0, False)
                     continue
@@ -1116,17 +994,39 @@ class FoundationPoseTracker:
                 tr = Transform()
                 tr.translation.x, tr.translation.y, tr.translation.z = t
                 tr.rotation.x, tr.rotation.y, tr.rotation.z, tr.rotation.w = q
-
                 parent_frame = self.camera_tf if self.camera_tf else "camera_color_optical_frame"
                 self.broadcast_transform_and_pose(tr, self.object_name, parent_frame)
 
                 vis = draw_posed_3d_box(self.K, img=color_rgb, ob_in_cam=center_pose, bbox=self.bbox)
                 vis = draw_xyz_axis(vis, ob_in_cam=self.pose, scale=0.05, K=self.K, thickness=3, transparency=0, is_input_rgb=True)
                 vis_bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
+
+                # ==========================================
+                # 5 秒自動重置計時器 & 第一幀儲存邏輯
+                # ==========================================
+                if self.tracking_start_time is None:
+                    self.tracking_start_time = time.time()
+
+                if not self.first_track_saved and self.debug_dir:
+                    self.track_save_count += 1
+                    timestamp_str = datetime.now().strftime("%H%M%S")
+                    save_path = os.path.join(self.debug_dir, f"cycle{self.track_save_count}_pose_{timestamp_str}.jpg")
+                    cv2.imwrite(save_path, vis_bgr)
+                    rospy.loginfo(f"[TEST] 已儲存第 {self.track_save_count} 次循環的 BBox/Seg/Pose 截圖")
+                    self.first_track_saved = True
+
+                # 若追蹤超過 5 秒，自動觸發重置 (所有模型都會套用)
+                if time.time() - self.tracking_start_time >= 5.0:
+                    rospy.logwarn(f"[TEST] {self.seg_backend} 追蹤已達 5 秒，觸發自動重置！")
+                    first_frame = True
+                    self.pose = None
+                    self.consecutive_det_count = 0
+                    self.tracking_start_time = None
+                    self.first_track_saved = False # 允許下次重置後存圖
+                    continue
                 
                 if self.iou_val is not None:
-                    bar_w, bar_h, margin = 220, 18, 10
-                    self.draw_conf_bar(vis_bgr,{"IoU": float(self.iou_val)},label="IoU",origin=(10, vis_bgr.shape[0] - margin - bar_h),size=(bar_w, bar_h),max_val=1.0)
+                    self.draw_conf_bar(vis_bgr,{"IoU": float(self.iou_val)},label="IoU",origin=(10, vis_bgr.shape[0] - 28),size=(220, 18),max_val=1.0)
                 
                 if self.init_mode == 'yolo':
                     vis_bgr, _new_iou  = self.periodic_yolo_iou(
@@ -1135,32 +1035,23 @@ class FoundationPoseTracker:
                         det_imgsz=self.det_imgsz, det_conf=self.det_conf, prefer_cls=self.prefer_cls,
                         vis_bgr=vis_bgr, log=self.iou_log
                     )
-                    if _new_iou is not None:
-                        self.iou_val = float(_new_iou) 
-                    
+                    if _new_iou is not None: self.iou_val = float(_new_iou) 
                     if self.iou_val is not None:
-                        if self.iou_val < self.iou_thresh:
-                            self.iou_bad_count += 1
-                        else:
-                            self.iou_bad_count = 0
+                        if self.iou_val < self.iou_thresh: self.iou_bad_count += 1
+                        else: self.iou_bad_count = 0
 
                         if self.iou_bad_count >= self.iou_patience:
                             self.iou_bad_count = 0
                             first_frame = True
                             self.pose = None
                             self.consecutive_det_count = 0  
-                            cv2.putText(vis_bgr, "Re-init (low IoU)", (10, 90),cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 1, cv2.LINE_AA)
+                            self.tracking_start_time = None
+                            self.first_track_saved = False
 
-                if self.got_depth and self.got_rgb:
-                    if self.depth_size != self.rgb_size:
-                        rospy.logwarn_throttle(2.0, "Depth and RGB image sizes differ: depth=%s rgb=%s", str(self.depth_size), str(self.rgb_size))
-            
             self.pump_windows(vis_bgr if (self.show_rgb_win and self.color is not None) else None,
                               self.depth_vis if (self.show_depth_win and self.got_depth and self.depth_vis is not None) else None)
-            if self.iou_val is not None:
-                self.confidence_publish(float(self.iou_val), not first_frame)
-            else:
-                self.confidence_publish(0.0, False)
+            if self.iou_val is not None: self.confidence_publish(float(self.iou_val), not first_frame)
+            else: self.confidence_publish(0.0, False)
 
             if self.perf_eval_enable and getattr(self, "perf_csv_path", None) is not None:
                 with open(self.perf_csv_path, mode='a', newline='') as f:
@@ -1171,6 +1062,6 @@ class FoundationPoseTracker:
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    rospy.init_node("foundationpose_tracker", anonymous=False)
-    node = FoundationPoseTracker()
+    rospy.init_node("foundationpose_tracker_benchmark", anonymous=False)
+    node = FoundationPoseTrackerBenchmark()
     node.spin()

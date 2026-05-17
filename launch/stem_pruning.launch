@@ -4,12 +4,7 @@
     </include> -->
     <arg name="depth_image_raw" default="/camera/aligned_depth_to_color/image_raw"/>
     <arg name="image_info" default="/camera/color/camera_info"/>
-    
-    <!-- <node pkg="depth_obstacle_detect" type="depth_obstacle_detect_node" name="depth_obstacle_detect" output="screen">
-        <param name="depth_topic" value="$(arg depth_image_raw)" />
-        <param name="camera_info_topic" value="$(arg image_info)" />
-        <param name="cam_id" value="cam1"/>
-    </node> -->
+    <arg name="perf_eval_enable" default="true"/>
 
     <node pkg="ros_foundationpose" type="stem_tracker.py" name="stem_tracker" output="screen">
         <param name="camera_info_topic" value="$(arg image_info)" />
@@ -18,16 +13,37 @@
         <param name="camera_tf" value="camera_color_optical_frame"/>
         <param name="child_tf" value="stem_estimated_frame"/>
 
+        <!-- 傳遞效能評估開關與 log 根目錄 -->
+        <param name="perf_eval_enable" type="bool" value="$(arg perf_eval_enable)" />
+        <param name="log_root_dir" type="string" value="$(find ros_foundationpose)/log" />
+
         <param name="pose_topic" value="/stem/pruning_pose" />
         <param name="pose_vis_topic" value="/stem/debug_vis_image" />
 
-        <param name="model_path" value="$(find ros_foundationpose)/data/bunch_stem-seg.pt" />
+        <!-- 模型與追蹤參數 -->
+        <param name="model_path" value="$(find ros_foundationpose)/data/oilpalm_stem.onnx" />
         <param name="target_cls" value="1" />
         <param name="conf_thresh" value="0.3" />
-
-        <param name="depth_min" value="0.03" />
+        <param name="depth_min" value="0.01" />
         <param name="depth_max" value="3.0" />
         <param name="assumed_stem_radius" value="0.0" />
-        <param name="det_select_mode" type="string" value="nearest_depth" />   <!-- middle | score |nearest_depth -->
+        <param name="det_select_mode" type="string" value="nearest_depth" /> <!-- middle / nearest_depth / score -->
+        <!-- 系統模式設定與紀錄參數 -->
+        <!-- 
+            1: yolo11n + SAM + cutie
+            2: yolo11n + SAM2 + cutie
+            3: yolo11n + FastSAM + cutie
+            4: yolo11n + SAM2
+            5: yolo11n + FastSAM
+        -->
+        <param name="pipeline_mode" type="int" value="1" /> 
+        
+        <!-- SAM/FastSAM/SAM2 權重路徑 -->
+        <param name="sam_ckpt" value="$(find ros_foundationpose)/data/sam/sam_l.pt" />
+        <param name="fastsam_ckpt" value="$(find ros_foundationpose)/data/fastsam/FastSAM-x.pt" />
+        <param name="sam2_ckpt" value="$(find ros_foundationpose)/data/sam2/sam2.1_l.pt" />
+
+        <!-- CSV 儲存路徑 -->
+        <param name="csv_log_path" type="string" value="$(find ros_foundationpose)/data/performance_log.csv" />
     </node>
 </launch>

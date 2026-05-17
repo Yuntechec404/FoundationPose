@@ -11,7 +11,7 @@
   <arg name="mesh_file"        default="$(find ros_foundationpose)/data/oilpalm/oilpalm.obj"/> <!-- 3D mesh (用於 pose estimation) -->
   <arg name="debug_dir"        default="$(find ros_foundationpose)/log"/> <!-- debug 輸出資料夾 -->
   <arg name="perf_eval_enable" default="true"/> <!-- 是否啟用效能評估 -->
-  <arg name="seg_backend"      default="bbox"/> <!-- segmentation backend (bbox / yolo11-seg / sam / sam2) -->
+  <arg name="seg_backend"      default="fastsam"/> <!-- segmentation backend (bbox / yolo11-seg / sam / sam2 /fastsam) -->
   
   <!-- ===================== YOLO / YOLO-seg ===================== -->
   <!-- <arg name="det_model"        default="$(find ros_foundationpose)/data/bunch_stem-seg.onnx"/>  -->
@@ -19,23 +19,26 @@
   <arg name="det_model"        default="$(find ros_foundationpose)/data/oilpalm_stem.onnx"/> 
   <!-- YOLO detection 模型 -->
 
-  <!-- ===================== SAM / SAM2 ===================== -->
-  <arg name="sam_model"        default="sam_h"/> 
-  <!-- SAM (sam_h / sam_l / sam_b / mobile_sam) -->
-  <!-- <arg name="sam_ckpt"         default="$(find ros_foundationpose)/data/sam/sam_vit_h_4b8939.pth"/>  -->
-  <!-- SAM 權重路徑 -->
-  <arg name="sam_ckpt"         default="$(find ros_foundationpose)/data/sam2/sam2_t.pt"/> 
+  <!-- ===================== SAM / SAM2 /FastSAM ===================== -->
+  <!-- <arg name="sam_ckpt"         default="$(find ros_foundationpose)/data/sam/sam_b.pt"/>  -->
+  <!-- SAM (sam_l.pt / sam_b.pt) -->
+
+  <!-- <arg name="sam_ckpt"         default="$(find ros_foundationpose)/data/sam2/sam2_t.pt"/>  -->
   <!-- SAM2 (sam2_t.pt / sam2_s.pt / sam2_b.pt / sam2_l.pt / sam2.1_t.pt / sam2.1_s.pt / sam2.1_b.pt / sam2.1_l.pt) -->
   
+  <arg name="sam_ckpt"         default="$(find ros_foundationpose)/data/fastsam/FastSAM-s.pt"/> 
+  <!-- FastSAM (FastSAM-s.pt / FastSAM-x.pt) -->
+
   <!-- ===================== 初始化策略 ===================== -->
   <arg name="init_mode"        default="yolo"/> <!-- 初始化方式：yolo / click -->
   <arg name="yolo_start_mode"  default="immediate"/> <!-- YOLO 啟動模式：immediate / wait -->
   
   <!-- ===================== Detection 參數 ===================== -->
-  <arg name="det_conf"         default="0.25"/> <!-- detection confidence threshold -->
-  <arg name="det_class"        default="0"/> <!-- 使用的類別 ID -->
-  <arg name="det_imgsz"        default="640"/> <!-- 輸入 YOLO 的影像大小 -->
-  <arg name="det_select_mode"  default="score"/> <!-- bbox 選擇策略：middle | score |nearest_depth -->
+  <arg name="init_det_patience" default="10"/> <!-- 連續穩定detection所需幀數 -->
+  <arg name="det_conf" default="0.25"/> <!-- detection confidence threshold -->
+  <arg name="det_class" default="0"/> <!-- 使用的類別 ID -->
+  <arg name="det_imgsz" default="640"/> <!-- 輸入 YOLO 的影像大小 -->
+  <arg name="det_select_mode" default="score"/> <!-- bbox 選擇策略：middle | score |nearest_depth -->
   
   <!-- ===================== Pose Estimation / Tracking ===================== -->
   <arg name="est_refine_iter"  default="5"/> <!-- 初始化 pose refine 次數 -->
@@ -89,13 +92,13 @@
     <!-- Model / Backend -->
     <param name="perf_eval_enable" value="$(arg perf_eval_enable)"/>
     <param name="seg_backend"      value="$(arg seg_backend)"/>
-    <param name="sam_model"        value="$(arg sam_model)"/>
     <param name="sam_ckpt"         value="$(arg sam_ckpt)"/>
     <param name="det_model"        value="$(arg det_model)"/>
     <param name="mesh_file"        value="$(arg mesh_file)"/>
     <param name="debug_dir"        value="$(arg debug_dir)"/>
 
     <!-- Init / Detection -->
+    <param name="init_det_patience" value="$(arg init_det_patience)"/>
     <param name="init_mode"        value="$(arg init_mode)"/>
     <param name="yolo_start_mode"  value="$(arg yolo_start_mode)"/>
     <param name="det_conf"         value="$(arg det_conf)"/>

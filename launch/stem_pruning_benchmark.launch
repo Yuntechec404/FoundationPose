@@ -1,0 +1,42 @@
+<launch>
+    <arg name="depth_image_raw" default="/camera/aligned_depth_to_color/image_raw"/>
+    <arg name="image_info" default="/camera/color/camera_info"/>
+    
+    <!-- 效能與測試控制變數 -->
+    <arg name="perf_eval_enable" default="true"/>
+    <arg name="pipeline_mode" default="1"/>
+    <arg name="log_root_dir" default="$(find ros_foundationpose)/log"/>
+    
+    <!-- 模型權重變數 (由 python 腳本動態覆蓋) -->
+    <arg name="sam_ckpt" default="sam_b.pt"/>
+    <arg name="fastsam_ckpt" default="FastSAM-s.pt"/>
+    <arg name="sam2_ckpt" default="sam2_b.pt"/>
+
+    <node pkg="ros_foundationpose" type="stem_tracker_benchmark.py" name="stem_tracker_benchmark" output="screen">
+        <param name="camera_info_topic" value="$(arg image_info)" />
+        <param name="image_raw_topic" value="/camera/color/image_raw" />
+        <param name="depth_topic" value="$(arg depth_image_raw)" />
+        <param name="camera_tf" value="camera_color_optical_frame"/>
+        <param name="child_tf" value="stem_estimated_frame"/>
+
+        <param name="pose_topic" value="/stem/pruning_pose" />
+        <param name="pose_vis_topic" value="/stem/debug_vis_image" />
+
+        <!-- 接收 launch args -->
+        <param name="perf_eval_enable" type="bool" value="$(arg perf_eval_enable)" />
+        <param name="pipeline_mode" type="int" value="$(arg pipeline_mode)" />
+        <param name="log_root_dir" type="string" value="$(arg log_root_dir)" />
+
+        <param name="sam_ckpt" value="$(arg sam_ckpt)" />
+        <param name="fastsam_ckpt" value="$(arg fastsam_ckpt)" />
+        <param name="sam2_ckpt" value="$(arg sam2_ckpt)" />
+
+        <param name="model_path" value="$(find ros_foundationpose)/data/oilpalm_stem.onnx" />
+        <param name="target_cls" value="0" />
+        <param name="conf_thresh" value="0.3" />
+        <param name="depth_min" value="0.01" />
+        <param name="depth_max" value="3.0" />
+        <param name="assumed_stem_radius" value="0.0" />
+        <param name="det_select_mode" type="string" value="nearest_depth" />
+    </node>
+</launch>
