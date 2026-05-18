@@ -1259,7 +1259,7 @@ class FoundationPosePipelineTracker:
             
             return P_c_new[:3]
 
-        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+        except Exception as e:
             rospy.logwarn_throttle(2.0, f"[Kinematics TF] Lookup failed, fallback to static: {e}")
             return self.last_stem_3d_pos
 
@@ -2157,7 +2157,11 @@ class FoundationPosePipelineTracker:
                                 if self.show_rgb_win:
                                     vis_bgr = self._overlay_mask(vis_bgr, used_mask, alpha=0.5, color=(0, 255, 255))
                                     cv2.circle(vis_bgr, projected_2d, 8, (0, 0, 255), -1) 
-                                    cv2.putText(vis_bgr, f"Depth:{smoothed_3d[2]:.2f}m", (projected_2d[0] + 10, projected_2d[1] - 10), 
+                                    
+                                    # 修正：計算相機到目標的三維直線距離 (歐式距離 = 根號(X^2 + Y^2 + Z^2))
+                                    true_dist = float(np.linalg.norm(smoothed_3d))
+                                    
+                                    cv2.putText(vis_bgr, f"Dist: {true_dist:.2f}m", (projected_2d[0] + 10, projected_2d[1] - 10), 
                                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                                 
                                 parent_frame = self.camera_tf if self.camera_tf else "camera_color_optical_frame"
