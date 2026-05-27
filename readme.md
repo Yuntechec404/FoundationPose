@@ -1,6 +1,6 @@
 # FoundationPose: Unified 6D Pose Estimation and Tracking of Novel Objects
 [[Paper]](https://arxiv.org/abs/2312.08344) [[Website]](https://nvlabs.github.io/FoundationPose/)
-[[404Code]](https://hackmd.io/@TT0uToXKQpyED6Su1XkdhQ/SJ8td4nGxg)
+[[404Hackmd]](https://hackmd.io/@TT0uToXKQpyED6Su1XkdhQ/SJ8td4nGxg)
 
 This is the official implementation of our paper to be appeared in CVPR 2024 (Highlight)
 
