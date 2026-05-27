@@ -246,26 +246,143 @@ class FoundationPose:
     '''
     return -torch.ones(len(poses), device='cuda', dtype=torch.float)
 
+  def _get_pose_crop_window(self, pose_current, K, H, W):
+    """
+    計算 Pose-Conditioned Cropping 的視窗範圍。
+    回傳: (top, bottom, left, right, center_u, center_v, z_distance) 或 None
+    """
+    t_est = pose_current[0, :3, 3].cpu().numpy()
+    z_distance = t_est[2]
+    
+    if z_distance <= 0.001:
+      return None
 
-  def track_one(self, rgb, depth, K, iteration, extra={}):
+    center_2d = K @ t_est
+    u = center_2d[0] / z_distance
+    v = center_2d[1] / z_distance
+    
+    scale = (self.diameter / z_distance) * K[0, 0] * 1.2 
+    half_s = int(scale / 2)
+    
+    left, right = max(0, int(u) - half_s), min(W, int(u) + half_s)
+    top, bottom = max(0, int(v) - half_s), min(H, int(v) + half_s)
+    
+    if right <= left or bottom <= top:
+      return None 
+
+    return (top, bottom, left, right, int(u - left), int(v - top), z_distance)
+  
+  def _compute_depth_confidence(self, crop_real_depth, crop_render_depth, z_distance):
+    """
+    計算MAE與Inlier Ratio。
+    回傳: (depth_mae, inlier_ratio, inliers, crop_render_mask)
+    """
+    import torch
+    import numpy as np
+
+    crop_render_mask = (crop_render_depth > 1e-3)
+    valid_area = crop_render_mask.sum().float()
+    
+    if valid_area <= 0:
+      return 999.0, 0.0, None, None
+
+    depth_diff = torch.abs(crop_real_depth - crop_render_depth)
+    
+    # 自適應閾值公式
+    dynamic_tolerance = np.clip((z_distance * 0.015) + (self.diameter * 0.05), 0.01, 0.08)
+    
+    # 計算 MAE
+    valid_obs = (crop_real_depth > 1e-3) & crop_render_mask
+    if valid_obs.sum() > 0:
+      depth_mae = depth_diff[valid_obs].mean().item()
+    else:
+      depth_mae = 999.0
+        
+    # 計算 Inlier Ratio
+    inliers = (depth_diff < dynamic_tolerance) & (crop_real_depth > 1e-3) & crop_render_mask
+    inlier_ratio = (inliers.sum().float() / valid_area).item()
+
+    return depth_mae, inlier_ratio, inliers, crop_render_mask
+  
+  def _save_debug_overlay(self, rgb, top, bottom, left, right, center_u, center_v, inliers, crop_render_mask, inlier_ratio, depth_mae):
+    """
+    將局部裁切框與信心指標繪製成除錯影像。
+    """
+    import time
+
+    inliers_np = inliers.cpu().numpy().astype(np.uint8) * 255
+    render_mask_np = crop_render_mask.cpu().numpy().astype(np.uint8) * 255
+    
+    overlay = rgb.copy()
+    cv2.rectangle(overlay, (left, top), (right, bottom), (0, 255, 255), 2)
+    crop_roi = overlay[top:bottom, left:right]
+    
+    red_layer = np.zeros_like(crop_roi)
+    red_layer[:, :, 2] = 255  
+    green_layer = np.zeros_like(crop_roi)
+    green_layer[:, :, 1] = 255 
+    
+    cv2.addWeighted(crop_roi, 1.0, red_layer, 0.7, 0, crop_roi, dtype=cv2.CV_8U)
+    crop_roi[inliers_np == 0] = rgb[top:bottom, left:right][inliers_np == 0] 
+    
+    temp_roi = crop_roi.copy()
+    cv2.addWeighted(temp_roi, 1.0, green_layer, 0.4, 0, temp_roi, dtype=cv2.CV_8U)
+    crop_roi[render_mask_np > 0] = temp_roi[render_mask_np > 0]
+    
+    cv2.drawMarker(crop_roi, (center_u, center_v), (255, 255, 255), markerType=cv2.MARKER_CROSS, markerSize=15, thickness=2)
+    
+    overlay[top:bottom, left:right] = crop_roi
+    
+    cv2.putText(overlay, f"Crop Inlier: {inlier_ratio:.2f}", (left, max(20, top - 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(overlay, f"Crop MAE: {depth_mae*100:.1f}cm", (left, max(45, top - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2, cv2.LINE_AA)
+    
+    timestamp = int(time.time() * 1000)
+    save_path = f"{self.debug_dir}/crop_conf_{timestamp}.png"
+    cv2.imwrite(save_path, overlay)
+
+  def track_one(self, rgb, depth, K, iteration, extra={}, enable_self_check=True):
     if self.pose_last is None:
       logging.info("Please init pose by register first")
       raise RuntimeError
-    # logging.info("Welcome")
 
-    depth = torch.as_tensor(depth, device='cuda', dtype=torch.float)
-    depth = erode_depth(depth, radius=2, device='cuda')
-    depth = bilateral_filter_depth(depth, radius=2, device='cuda')
-    # logging.info("depth processing done")
+    depth_tensor = torch.as_tensor(depth, device='cuda', dtype=torch.float)
+    depth_tensor = erode_depth(depth_tensor, radius=2, device='cuda')
+    depth_tensor = bilateral_filter_depth(depth_tensor, radius=2, device='cuda')
 
-    xyz_map = depth2xyzmap_batch(depth[None], torch.as_tensor(K, dtype=torch.float, device='cuda')[None], zfar=np.inf)[0]
+    xyz_map = depth2xyzmap_batch(depth_tensor[None], torch.as_tensor(K, dtype=torch.float, device='cuda')[None], zfar=np.inf)[0]
 
-    pose, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=self.pose_last.reshape(1,4,4).data.cpu().numpy(), normal_map=None, xyz_map=xyz_map, mesh_diameter=self.diameter, glctx=self.glctx, iteration=iteration, get_vis=self.debug>=2)
-    # logging.info("pose done")
-    if self.debug>=2:
-      extra['vis'] = vis
+    pose_current = self.pose_last.reshape(1, 4, 4)
+    H, W = rgb.shape[:2]
 
-    # logging.info(f"Pose score: {score:.3f}")
-    self.pose_last = pose
-    return (pose@self.get_tf_to_centered_mesh()).data.cpu().numpy().reshape(4,4)
+    # Refinement
+    pose_next, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=pose_current.data.cpu().numpy() if torch.is_tensor(pose_current) else pose_current, normal_map=None, xyz_map=xyz_map, mesh_diameter=self.diameter, glctx=self.glctx, iteration=1, get_vis=self.debug>=2)
+    pose_current = torch.as_tensor(pose_next, device='cuda', dtype=torch.float)
 
+    if enable_self_check:
+      _, render_depth, _ = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=pose_current, glctx=self.glctx, mesh_tensors=self.mesh_tensors)
+      render_depth_2d = render_depth[0, ..., 0] if render_depth.ndim == 4 else render_depth[0]
+      
+      # 取得裁切視窗
+      crop_info = self._get_pose_crop_window(pose_current, K, H, W)
+      
+      if crop_info is not None:
+        top, bottom, left, right, center_u, center_v, z_dist = crop_info
+        
+        # 計算信心分數
+        depth_mae, inlier_ratio, inliers, render_mask = self._compute_depth_confidence(depth_tensor[top:bottom, left:right], render_depth_2d[top:bottom, left:right], z_dist)
+        
+        # 視覺化除錯
+        # if self.debug >= 1 and inliers is not None:
+        #   self._save_debug_overlay(rgb, top, bottom, left, right, center_u, center_v, inliers, render_mask, inlier_ratio, depth_mae)
+      else:
+        depth_mae, inlier_ratio = 999.0, 0.0
+
+      extra['depth_mae'] = depth_mae
+      extra['inlier_ratio'] = inlier_ratio
+
+    if self.debug >= 2:
+        extra['vis'] = vis
+    
+    self.pose_last = pose_current[0]
+    
+    return (self.pose_last @ self.get_tf_to_centered_mesh()).data.cpu().numpy().reshape(4,4)
