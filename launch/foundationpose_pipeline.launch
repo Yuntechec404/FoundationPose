@@ -19,7 +19,7 @@
   <!-- YOLOv11-seg模型的權重路徑 -->
   <arg name="sam_ckpt" default="$(find ros_foundationpose)/data/sam/sam_b.pt"/>
   <!-- SAM模型的權重路徑 -->
-  <arg name="sam2_ckpt" default="$(find ros_foundationpose)/data/sam2/sam2_l.pt"/>
+  <arg name="sam2_ckpt" default="$(find ros_foundationpose)/data/sam2/sam2.1_l.pt"/>
   <!-- SAM2模型的權重路徑 -->
   <arg name="fastsam_ckpt" default="$(find ros_foundationpose)/data/fastsam/FastSAM-s.pt"/>
   <!-- FastSAM模型的權重路徑 -->
@@ -50,7 +50,7 @@
   <arg name="iou_patience" default="3"/>
   <arg name="seg_warmup_n" default="8"/>
   <!-- 剛鎖定目標的前N幀，會計算遮蔽率，N幀過後會降級為只計算2DIoU -->
-  <arg name="policy_occ_thresh_high" default="0.25"/>
+  <arg name="policy_occ_thresh_high" default="0.15"/>
   <!-- 當果串被樹葉遮擋的比例大於此值 (如 0.90 即 90%)。 -->
   <arg name="policy_high_patience" default="3"/>
   <!-- 需連續高遮蔽N幀，切換為STEM模式。 -->
