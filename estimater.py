@@ -16,7 +16,8 @@ import yaml
 
 
 class FoundationPose:
-  def __init__(self, model_pts, model_normals, symmetry_tfs=None, mesh=None, scorer:ScorePredictor=None, refiner:PoseRefinePredictor=None, glctx=None, debug=0, debug_dir='/home/bowen/debug/novel_pose_debug/'):
+  def __init__(self, model_pts, model_normals, symmetry_tfs=None, mesh=None, scorer:ScorePredictor=None, refiner:PoseRefinePredictor=None, glctx=None, debug=0, debug_dir='/home/user/debug/novel_pose_debug/',
+               coarse_min_n_views=40, coarse_inplane_step=60, coarse_orientation_mode="uniform", coarse_orientation_tilt_deg=30.0, coarse_object_up_axis=1):
     self.gt_pose = None
     self.ignore_normal_flip = True
     self.debug = debug
@@ -24,7 +25,7 @@ class FoundationPose:
     os.makedirs(debug_dir, exist_ok=True)
 
     self.reset_object(model_pts, model_normals, symmetry_tfs=symmetry_tfs, mesh=mesh)
-    self.make_rotation_grid(min_n_views=40, inplane_step=60)
+    self.make_rotation_grid(min_n_views=coarse_min_n_views, inplane_step=coarse_inplane_step, orientation_mode=coarse_orientation_mode, orientation_tilt_deg=coarse_orientation_tilt_deg, object_up_axis=coarse_object_up_axis)
 
     self.glctx = glctx
 
@@ -101,28 +102,112 @@ class FoundationPose:
     if self.glctx is not None:
       self.glctx = dr.RasterizeCudaContext(s)
 
+  def _coarse_orientation_ok(self,ob_in_cam: np.ndarray,orientation_mode: str = "uniform",orientation_tilt_deg: float = 30.0,object_up_axis: int = 2):
+    """
+    orientation_mode:
+      "uniform"  : keep original uniform sampling, no filtering
+      "upright"  : keep upright + slightly tilted upright poses
+      "inverted" : keep inverted + slightly tilted inverted poses
 
+    object_up_axis:
+      0 -> object local X is semantic up
+      1 -> object local Y is semantic up
+      2 -> object local Z is semantic up
 
-  def make_rotation_grid(self, min_n_views=40, inplane_step=60):
+    OpenCV camera convention:
+      +X right, +Y down, +Z forward.
+      Therefore screen up is [0, -1, 0], screen down is [0, 1, 0].
+    """
+    mode = (orientation_mode or "uniform").strip().lower()
+
+    if mode in ["uniform", "all", "none"]:
+      return True, "uniform", 0.0
+
+    if mode not in ["upright", "inverted"]:
+      raise ValueError(f"Unknown orientation_mode={orientation_mode}. "f"Use 'uniform', 'upright', or 'inverted'.")
+
+    obj_up_in_cam = ob_in_cam[:3, object_up_axis].astype(np.float64)
+    norm = np.linalg.norm(obj_up_in_cam)
+    if norm < 1e-12:
+      return True, "neutral", 0.0
+
+    obj_up_in_cam = obj_up_in_cam / norm
+
+    screen_up = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+    screen_down = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
+    if mode == "upright":
+      target = screen_up
+    else:
+      target = screen_down
+
+    cos_angle = float(np.dot(obj_up_in_cam, target))
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    angle_deg = float(np.rad2deg(np.arccos(cos_angle)))
+
+    ok = angle_deg <= float(orientation_tilt_deg)
+    return ok, mode, angle_deg
+
+  def make_rotation_grid(self,min_n_views=40,inplane_step=60,orientation_mode="uniform",orientation_tilt_deg=30.0,object_up_axis=2):
+    """
+    Coarse pose sampling.
+
+    orientation_mode:
+      "uniform": 原本均勻採樣，不篩姿態
+      "upright": 正放 + 正放微微傾斜，orientation_tilt_deg 控制
+      "inverted": 倒放 + 倒放微微傾斜，orientation_tilt_deg 控制
+
+    orientation_tilt_deg:
+      允許物體 local up 軸偏離目標方向的角度。
+      例如 30 表示正放/倒放方向 ±30 度內都保留。
+
+    object_up_axis:
+      0:X, 1:Y, 2:Z。
+      預設 2，代表物體模型座標 local +Z 是物體上方。
+    """
+    orientation_mode = (orientation_mode or "uniform").strip().lower()
     cam_in_obs = sample_views_icosphere(n_views=min_n_views)
-    # logging.info(f'cam_in_obs:{cam_in_obs.shape}')
+
     rot_grid = []
+    orientation_counter = {"kept": 0,"dropped": 0,"uniform": 0,"upright": 0,"inverted": 0,"neutral": 0}
+
     for i in range(len(cam_in_obs)):
       for inplane_rot in np.deg2rad(np.arange(0, 360, inplane_step)):
-        cam_in_ob = cam_in_obs[i]
-        R_inplane = euler_matrix(0,0,inplane_rot)
-        cam_in_ob = cam_in_ob@R_inplane
+        cam_in_ob = cam_in_obs[i].copy()
+        R_inplane = euler_matrix(0, 0, inplane_rot)
+        cam_in_ob = cam_in_ob @ R_inplane
+
         ob_in_cam = np.linalg.inv(cam_in_ob)
+
+        ok, measured_mode, angle_deg = self._coarse_orientation_ok(ob_in_cam=ob_in_cam,orientation_mode=orientation_mode,orientation_tilt_deg=orientation_tilt_deg,object_up_axis=object_up_axis,)
+
+        if measured_mode in orientation_counter:
+          orientation_counter[measured_mode] += 1
+
+        if not ok:
+          orientation_counter["dropped"] += 1
+          continue
+
+        orientation_counter["kept"] += 1
         rot_grid.append(ob_in_cam)
 
     rot_grid = np.asarray(rot_grid)
-    # logging.info(f"rot_grid:{rot_grid.shape}")
-    rot_grid = mycpp.cluster_poses(30, 99999, rot_grid, self.symmetry_tfs.data.cpu().numpy())
-    rot_grid = np.asarray(rot_grid)
-    # logging.info(f"after cluster, rot_grid:{rot_grid.shape}")
-    self.rot_grid = torch.as_tensor(rot_grid, device='cuda', dtype=torch.float)
-    # logging.info(f"self.rot_grid: {self.rot_grid.shape}")
 
+    if len(rot_grid) == 0:
+      raise RuntimeError(
+        f"No coarse pose left after orientation filtering. "
+        f"orientation_mode={orientation_mode}, "
+        f"orientation_tilt_deg={orientation_tilt_deg}, "
+        f"object_up_axis={object_up_axis}"
+      )
+
+    rot_grid = mycpp.cluster_poses(30,99999,rot_grid,self.symmetry_tfs.data.cpu().numpy())
+
+    rot_grid = np.asarray(rot_grid)
+
+    logging.info(f"after cluster, rot_grid:{rot_grid.shape}")
+
+    self.rot_grid = torch.as_tensor(rot_grid, device='cuda', dtype=torch.float)
 
   def generate_random_pose_hypo(self, K, rgb, depth, mask, scene_pts=None):
     '''
