@@ -10,8 +10,8 @@
   <!-- ===================== 模型與系統設定 ===================== -->
   <arg name="mesh_file"        default="$(find ros_foundationpose)/data/oilpalm/oilpalm.obj"/> <!-- 3D mesh (用於 pose estimation) -->
   <arg name="debug_dir"        default="$(find ros_foundationpose)/log"/> <!-- debug 輸出資料夾 -->
-  <arg name="perf_eval_enable" default="true"/> <!-- 是否啟用效能評估 -->
-  <arg name="seg_backend"      default="fastsam"/> <!-- segmentation backend (bbox / yolo11-seg / sam / sam2 /fastsam) -->
+  <arg name="perf_eval_enable" default="false"/> <!-- 是否啟用效能評估 -->
+  <arg name="seg_backend"      default="sam2"/> <!-- segmentation backend (bbox / yolo11-seg / sam / sam2 /fastsam) -->
   
   <!-- ===================== YOLO / YOLO-seg ===================== -->
   <!-- <arg name="det_model"        default="$(find ros_foundationpose)/data/bunch_stem-seg.onnx"/>  -->
@@ -23,16 +23,16 @@
   <!-- <arg name="sam_ckpt"         default="$(find ros_foundationpose)/data/sam/sam_b.pt"/>  -->
   <!-- SAM (sam_l.pt / sam_b.pt) -->
 
-  <!-- <arg name="sam_ckpt"         default="$(find ros_foundationpose)/data/sam2/sam2_t.pt"/>  -->
+  <arg name="sam_ckpt"         default="$(find ros_foundationpose)/data/sam2/sam2_t.pt"/> 
   <!-- SAM2 (sam2_t.pt / sam2_s.pt / sam2_b.pt / sam2_l.pt / sam2.1_t.pt / sam2.1_s.pt / sam2.1_b.pt / sam2.1_l.pt) -->
   
-  <arg name="sam_ckpt"         default="$(find ros_foundationpose)/data/fastsam/FastSAM-s.pt"/> 
+  <!-- <arg name="sam_ckpt"         default="$(find ros_foundationpose)/data/fastsam/FastSAM-s.pt"/>  -->
   <!-- FastSAM (FastSAM-s.pt / FastSAM-x.pt) -->
 
   <!-- ===================== 初始化策略 ===================== -->
   <arg name="init_mode"        default="yolo"/> <!-- 初始化方式：yolo / click -->
   <arg name="yolo_start_mode"  default="immediate"/> <!-- YOLO 啟動模式：immediate / wait -->
-  
+
   <!-- ===================== Detection 參數 ===================== -->
   <arg name="init_det_patience" default="10"/> <!-- 連續穩定detection所需幀數 -->
   <arg name="det_conf" default="0.25"/> <!-- detection confidence threshold -->
@@ -43,13 +43,24 @@
   <!-- ===================== Pose Estimation / Tracking ===================== -->
   <arg name="est_refine_iter"  default="5"/> <!-- 初始化 pose refine 次數 -->
   <arg name="track_refine_iter" default="2"/> <!-- tracking 時 refine 次數 -->
+
+  <!-- ===================== Coarse Initial Pose Sampling ===================== -->
+  <arg name="coarse_min_n_views"              default="40"/> <!-- icosphere 最少視角數；40 通常會產生 42 個視角 -->
+  <arg name="coarse_inplane_step"             default="60"/> <!-- 平面內旋轉間隔；60=6 rotations，30=12 rotations -->
+  <arg name="coarse_orientation_mode"         default="upright"/> <!-- uniform / upright / inverted -->
+  <arg name="coarse_orientation_tilt_deg"     default="80.0"/> <!-- 正放/倒放允許傾斜角度，單位 deg -->
+  <arg name="coarse_object_up_axis"           default="1"/> <!-- 0=X, 1=Y, 2=Z；目前定義綠色 Y 軸為判斷軸 -->
   
   <!-- ===================== ROI / IoU 控制 ===================== -->
+  <arg name="reinit_mode"      default="depth_confidence"/> <!-- reinit 模式：yolo_iou / depth_confidence -->
   <arg name="roi_expand"       default="0.01"/> <!-- ROI 擴張比例 -->
   <arg name="iou_stride"       default="3"/> <!-- IoU 計算的採樣間距 -->
   <arg name="iou_thresh"       default="0.1"/> <!-- IoU 門檻（低於此值視為 tracking 失敗） -->
-  <arg name="iou_patience"     default="3"/> <!-- 容忍連續失敗次數 -->
-  
+  <arg name="iou_patience"     default="5"/> <!-- 容忍連續失敗次數 -->
+  <arg name="geom_mae_thresh"    default="0.1"/> <!-- depth_confidence 模式：Depth MAE 門檻，單位 m -->
+  <arg name="geom_inlier_thresh" default="0.5"/> <!-- depth_confidence 模式：Inlier Ratio 門檻 -->
+  <arg name="geom_patience"      default="5"/> <!-- depth_confidence 模式：連續失敗幀數 -->
+
   <!-- ===================== 視覺化顯示 ===================== -->
   <arg name="show_depth_window" default="false"/> <!-- 是否顯示深度視窗 -->
   <arg name="show_rgb_window"   default="true"/> <!-- 是否顯示 RGB 視窗 -->
@@ -60,28 +71,8 @@
   <arg name="max_depth_mm"      default="2000.0"/> <!-- 最大顯示深度（mm） -->
   <arg name="colormap"          default="2"/> <!-- OpenCV colormap 類型 -->
   <arg name="invert_colormap"   default="false"/> <!-- 是否反轉 colormap -->
-  
-  <!-- ===================== Post-processing (姿態驗證 / 過濾) ===================== -->
-  <arg name="pp_enable"               default="false"/> <!-- 是否啟用後處理過濾 -->
-  <arg name="pp_up_axis"              default="y"/> <!-- 物體的「上方向」軸 -->
-  <arg name="pp_expect_orientation"   default="inverted"/> <!-- 預期姿態（upright/ inverted） -->
-  <arg name="pp_orient_center_tol_px" default="20.0"/> <!-- 姿態中心容許誤差（pixel） -->
- 
-  <!-- ===================== 尺寸驗證 ===================== -->
-  <arg name="pp_size_mode"        default="bbox_mm"/> <!-- 尺寸判斷模式（bbox_mm / depth） -->
-  <arg name="pp_expect_bbox_w_mm" default="115.0"/> <!-- 預期 bbox 寬度（mm） -->
-  <arg name="pp_expect_bbox_h_mm" default="80.0"/> <!-- 預期 bbox 高度（mm） -->
-  <arg name="pp_size_ratio_min"   default="0.6"/> <!-- 尺寸比例最小值（過小視為錯誤） -->
-  
-  <!-- ===================== 深度驗證 ===================== -->
-  <arg name="pp_expect_depth_m"   default="1.2"/> <!-- 預期深度（m） -->
-  <arg name="pp_depth_tol_m"      default="0.25"/> <!-- 深度容忍誤差 -->
-  <arg name="pp_retry_delay_sec"  default="1.0"/> <!-- 失敗後 retry 間隔 -->
 
-  <!-- ===================== Node ===================== -->
   <node pkg="ros_foundationpose" type="foundationpose_tracker.py" name="foundationpose_tracker" output="screen">
-
-    <!-- Topics -->
     <param name="image_topic"      value="$(arg image_topic)"/>
     <param name="info_topic"       value="$(arg info_topic)"/>
     <param name="depth_topic"      value="$(arg depth_topic)"/>
@@ -89,7 +80,6 @@
     <param name="camera_tf"        value="$(arg camera_tf)"/>
     <param name="object_name"      value="$(arg object_name)"/>
 
-    <!-- Model / Backend -->
     <param name="perf_eval_enable" value="$(arg perf_eval_enable)"/>
     <param name="seg_backend"      value="$(arg seg_backend)"/>
     <param name="sam_ckpt"         value="$(arg sam_ckpt)"/>
@@ -97,26 +87,32 @@
     <param name="mesh_file"        value="$(arg mesh_file)"/>
     <param name="debug_dir"        value="$(arg debug_dir)"/>
 
-    <!-- Init / Detection -->
-    <param name="init_det_patience" value="$(arg init_det_patience)"/>
     <param name="init_mode"        value="$(arg init_mode)"/>
     <param name="yolo_start_mode"  value="$(arg yolo_start_mode)"/>
     <param name="det_conf"         value="$(arg det_conf)"/>
     <param name="det_class"        value="$(arg det_class)"/>
     <param name="det_imgsz"        value="$(arg det_imgsz)"/>
     <param name="det_select_mode"  value="$(arg det_select_mode)"/>
+    <param name="init_det_patience" value="$(arg init_det_patience)"/>
 
-    <!-- Tracking -->
     <param name="est_refine_iter"   value="$(arg est_refine_iter)"/>
     <param name="track_refine_iter" value="$(arg track_refine_iter)"/>
 
-    <!-- IoU / ROI -->
-    <param name="roi_expand"    value="$(arg roi_expand)"/>
-    <param name="iou_stride"    value="$(arg iou_stride)"/>
-    <param name="iou_thresh"    value="$(arg iou_thresh)"/>
-    <param name="iou_patience"  value="$(arg iou_patience)"/>
+    <param name="coarse/min_n_views"              value="$(arg coarse_min_n_views)"/>
+    <param name="coarse/inplane_step"             value="$(arg coarse_inplane_step)"/>
+    <param name="coarse/orientation_mode"         value="$(arg coarse_orientation_mode)"/>
+    <param name="coarse/orientation_tilt_deg"     value="$(arg coarse_orientation_tilt_deg)"/>
+    <param name="coarse/object_up_axis"           value="$(arg coarse_object_up_axis)"/>
 
-    <!-- Visualization -->
+    <param name="reinit_mode"        value="$(arg reinit_mode)"/>
+    <param name="roi_expand"         value="$(arg roi_expand)"/>
+    <param name="iou_stride"         value="$(arg iou_stride)"/>
+    <param name="iou_thresh"         value="$(arg iou_thresh)"/>
+    <param name="iou_patience"       value="$(arg iou_patience)"/>
+    <param name="geom_mae_thresh"    value="$(arg geom_mae_thresh)"/>
+    <param name="geom_inlier_thresh" value="$(arg geom_inlier_thresh)"/>
+    <param name="geom_patience"      value="$(arg geom_patience)"/>
+
     <param name="show_depth_window" value="$(arg show_depth_window)"/>
     <param name="show_rgb_window"   value="$(arg show_rgb_window)"/>
     <param name="depth_win_name"    value="$(arg depth_win_name)"/>
@@ -126,21 +122,5 @@
     <param name="max_depth_mm"      value="$(arg max_depth_mm)"/>
     <param name="colormap"          value="$(arg colormap)"/>
     <param name="invert_colormap"   value="$(arg invert_colormap)"/>
-    
-    <!-- Post-processing -->
-    <param name="postproc/enable"               value="$(arg pp_enable)"/>
-    <param name="postproc/up_axis"              value="$(arg pp_up_axis)"/>
-    <param name="postproc/expect_orientation"   value="$(arg pp_expect_orientation)"/>
-    <param name="postproc/orient_center_tol_px" value="$(arg pp_orient_center_tol_px)"/>
-
-    <param name="postproc/size_mode"        value="$(arg pp_size_mode)"/>
-    <param name="postproc/expect_bbox_w_mm" value="$(arg pp_expect_bbox_w_mm)"/>
-    <param name="postproc/expect_bbox_h_mm" value="$(arg pp_expect_bbox_h_mm)"/>
-    <param name="postproc/size_ratio_min"   value="$(arg pp_size_ratio_min)"/>
-
-    <param name="postproc/expect_depth_m"   value="$(arg pp_expect_depth_m)"/>
-    <param name="postproc/depth_tolerance_m" value="$(arg pp_depth_tol_m)"/>
-    <param name="postproc/retry_delay_sec"  value="$(arg pp_retry_delay_sec)"/>
-
   </node>
 </launch>

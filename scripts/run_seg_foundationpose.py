@@ -103,4 +103,4 @@ if __name__ == "__main__":
     for config in TEST_SUITES:
         run_single_test(config)
 
-    print("🎉 所有 Benchmark 測試項目已順利執行完畢！")
+    print("所有 Benchmark 測試項目已順利執行完畢！")
