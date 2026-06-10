@@ -241,7 +241,7 @@ class FoundationPose:
     return center.reshape(3)
 
 
-  def register(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5):
+  def register(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5, top_k=5, top_flag=False):
     '''Copmute pose from given pts to self.pcd
     @pts: (N,3) np array, downsampled scene points
     '''
@@ -285,6 +285,7 @@ class FoundationPose:
     self.ob_id = ob_id
     self.ob_mask = ob_mask
 
+    # 1. 產生候選姿態 (Generate random pose hypotheses)
     poses = self.generate_random_pose_hypo(K=K, rgb=rgb, depth=depth, mask=ob_mask, scene_pts=None)
     poses = poses.data.cpu().numpy()
     # logging.info(f'poses:{poses.shape}')
@@ -297,10 +298,24 @@ class FoundationPose:
     # logging.info(f"after viewpoint, add_errs min:{add_errs.min()}")
 
     xyz_map = depth2xyzmap(depth, K)
-    poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, xyz_map=xyz_map, glctx=self.glctx, mesh_diameter=self.diameter, iteration=iteration, get_vis=self.debug>=2)
+    if top_flag == True:
+
+      # 2. 所有候選姿態送入比對學習 (Scoring all hypotheses without refinement)
+      scores_init, _ = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=False)
+      
+      # 3. 找出相對 TOP-X
+      # 避免候選姿態數量少於 top_k，取最小值
+      actual_top_k = min(top_k, len(poses))
+      ids_init = torch.as_tensor(scores_init).argsort(descending=True)
+      top_ids = ids_init[:actual_top_k]
+      poses = poses[top_ids]  # 只保留 Top-X 的姿態
+
+    # 4. TOP-X refinement 5 次
+    poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, xyz_map=xyz_map, glctx=self.glctx, mesh_diameter=self.diameter, iteration=iteration, get_vis=self.debug>=2, depth_roi_mask=ob_mask)
     if vis is not None:
       imageio.imwrite(f'{self.debug_dir}/vis_refiner.png', vis)
 
+    # 5. 將 refine 後的 Top-X 再次送入比對學習，找最高分
     scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=self.debug>=2)
     if vis is not None:
       imageio.imwrite(f'{self.debug_dir}/vis_score.png', vis)
@@ -308,6 +323,7 @@ class FoundationPose:
     add_errs = self.compute_add_err_to_gt_pose(poses)
     # logging.info(f"final, add_errs min:{add_errs.min()}")
 
+    # 對最後 Top-X 的分數進行排序並挑選最佳結果
     ids = torch.as_tensor(scores).argsort(descending=True)
     # logging.info(f'sort ids:{ids}') # pose index after refinement ------------------------
     scores = scores[ids]
@@ -323,7 +339,6 @@ class FoundationPose:
     self.scores = scores
 
     return best_pose.data.cpu().numpy()
-
 
   def compute_add_err_to_gt_pose(self, poses):
     '''

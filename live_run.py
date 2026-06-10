@@ -110,7 +110,7 @@ def init_via_yolo_roi(detector, color, depth, K, est, est_refine_iter, roi_expan
         return None, None
     det_xyxy = clip_xyxy(det_xyxy, W, H)
     mask = rect_to_mask(depth, det_xyxy, expand=roi_expand)
-    pose = est.register(K=K, rgb=color, depth=depth, ob_mask=mask, iteration=est_refine_iter)
+    pose = est.register(K=K, rgb=color, depth=depth, ob_mask=mask, iteration=est_refine_iter, top_k=5)
     return pose, mask
 
 # =========================
@@ -185,7 +185,7 @@ if __name__ == '__main__':
                 if args.init_mode == 'click':
                     if selecting_bbox:
                         if update_bbox_selection(color):
-                            pose = est.register(K=K, rgb=color, depth=depth, ob_mask=create_mask(depth, box_points), iteration=args.est_refine_iter)
+                            pose = est.register(K=K, rgb=color, depth=depth, ob_mask=create_mask(depth, box_points), iteration=args.est_refine_iter, top_k=5)
                             box_points.clear()
                             first_frame = False
                     else:
