@@ -1,0 +1,6 @@
+depth_refine:
+  mode: vgicp
+  apply: trans_z
+  accept_if_better: true
+  auto_sweep: true
+  log: true

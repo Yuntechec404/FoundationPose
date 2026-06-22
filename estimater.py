@@ -311,11 +311,17 @@ class FoundationPose:
       poses = poses[top_ids]  # 只保留 Top-X 的姿態
 
     # 4. TOP-X refinement 5 次
-    poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, xyz_map=xyz_map, glctx=self.glctx, mesh_diameter=self.diameter, iteration=iteration, get_vis=self.debug>=2, depth_roi_mask=ob_mask)
+    poses_refined, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, xyz_map=xyz_map, glctx=self.glctx, mesh_diameter=self.diameter, iteration=iteration, get_vis=self.debug>=2)
     if vis is not None:
       imageio.imwrite(f'{self.debug_dir}/vis_refiner.png', vis)
 
-    # 5. 將 refine 後的 Top-X 再次送入比對學習，找最高分
+    # 4.5 Score the learned refined candidates FIRST.
+    # Important: do not duplicate candidates here. The previous design scored
+    # original+geometry-corrected poses (e.g. 252+252=504), which doubled the
+    # scorer memory and could cause CUDA OOM.
+    poses = poses_refined
+
+    # 5. Send only RefineNet candidates to the learned scorer and select the best one.
     scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=self.debug>=2)
     if vis is not None:
       imageio.imwrite(f'{self.debug_dir}/vis_score.png', vis)
@@ -323,20 +329,103 @@ class FoundationPose:
     add_errs = self.compute_add_err_to_gt_pose(poses)
     # logging.info(f"final, add_errs min:{add_errs.min()}")
 
-    # 對最後 Top-X 的分數進行排序並挑選最佳結果
     ids = torch.as_tensor(scores).argsort(descending=True)
-    # logging.info(f'sort ids:{ids}') # pose index after refinement ------------------------
     scores = scores[ids]
     poses = poses[ids]
 
-    # logging.info(f'sorted scores:{scores}')
-
-    best_pose = poses[0]@self.get_tf_to_centered_mesh()
-    self.pose_last = poses[0]
+    # Keep the scorer-best pose as fallback.
+    best_centered_pose = poses[0:1]
     self.best_id = ids[0]
 
-    self.poses = poses
-    self.scores = scores
+    # 5.5 Optional depth geometry correction AFTER scorer, using top-k reranking.
+    #
+    # Safer and more useful than correcting only the single best pose:
+    #   candidates -> RefineNet -> scorer -> top-k poses
+    #   -> geometry correction for top-k
+    #   -> scorer re-ranks [original top-k + corrected top-k]
+    #   -> final pose
+    #
+    # top_k is passed by run_linemod.py:
+    #   est.register(..., top_k=20, top_flag=True)
+    #
+    # If top_flag=True, the same top_k is also used earlier to keep only the
+    # best initial hypotheses before RefineNet.  If top_flag=False, this block
+    # still uses top_k after the refined scorer.
+    depth_mode = str(getattr(self.refiner.cfg, 'depth_refine_mode', 'none')).lower() if hasattr(self.refiner, 'cfg') else 'none'
+    if depth_mode not in ['none', 'off', 'false', '0'] and hasattr(self.refiner, 'depth_geometry_refine_poses'):
+      try:
+        torch.cuda.empty_cache()
+      except Exception:
+        pass
+
+      actual_refine_top_k = int(max(1, min(int(top_k), len(poses))))
+      original_topk = poses[:actual_refine_top_k]
+
+      corrected_topk = self.refiner.depth_geometry_refine_poses(
+        mesh=self.mesh,
+        mesh_tensors=self.mesh_tensors,
+        rgb=rgb,
+        depth=depth,
+        K=K,
+        ob_in_cams=original_topk.data.cpu().numpy(),
+        normal_map=normal_map,
+        xyz_map=xyz_map,
+        glctx=self.glctx,
+        mesh_diameter=self.diameter,
+        depth_roi_mask=ob_mask
+      )
+
+      if torch.is_tensor(corrected_topk) and len(corrected_topk) > 0:
+        corrected_topk = corrected_topk.reshape(-1, 4, 4)
+
+        # Re-rank only a small set to avoid the previous 252+252 OOM problem.
+        rerank_poses = torch.cat([original_topk, corrected_topk], dim=0)
+
+        rerank_scores, vis = self.scorer.predict(
+          mesh=self.mesh,
+          rgb=rgb,
+          depth=depth,
+          K=K,
+          ob_in_cams=rerank_poses.data.cpu().numpy(),
+          normal_map=normal_map,
+          mesh_tensors=self.mesh_tensors,
+          glctx=self.glctx,
+          mesh_diameter=self.diameter,
+          get_vis=self.debug>=2
+        )
+        if vis is not None:
+          imageio.imwrite(f'{self.debug_dir}/vis_score_depth_topk_rerank.png', vis)
+
+        rerank_ids = torch.as_tensor(rerank_scores).argsort(descending=True)
+        rerank_scores_sorted = rerank_scores[rerank_ids]
+        rerank_poses_sorted = rerank_poses[rerank_ids]
+
+        best_centered_pose = rerank_poses_sorted[0:1]
+
+        # Store final candidates/scores as reranked small candidate set.
+        self.poses = rerank_poses_sorted
+        self.scores = rerank_scores_sorted
+        self.best_id = rerank_ids[0]
+
+        n_corrected = int(len(corrected_topk))
+        chosen = int(rerank_ids[0].item())
+        chosen_src = "original_topk" if chosen < actual_refine_top_k else "corrected_topk"
+        logging.info(
+          f"[DepthRefine] Applied post-score top-k rerank: mode={depth_mode}, "
+          f"top_k={actual_refine_top_k}, rerank_candidates={len(rerank_poses)}, "
+          f"corrected={n_corrected}, final_from={chosen_src}, "
+          f"candidates_scored_before_rerank={len(poses_refined)}"
+        )
+      else:
+        logging.info(f"[DepthRefine] Post-score {depth_mode} returned no corrected top-k poses; keep scorer best pose.")
+        self.poses = poses
+        self.scores = scores
+    else:
+      self.poses = poses
+      self.scores = scores
+
+    best_pose = best_centered_pose[0] @ self.get_tf_to_centered_mesh()
+    self.pose_last = best_centered_pose[0]
 
     return best_pose.data.cpu().numpy()
 

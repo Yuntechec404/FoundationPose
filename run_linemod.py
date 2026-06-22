@@ -126,6 +126,30 @@ def get_bop_reader_class(dataset_name):
 
 
 
+def parse_obj_ids_arg(obj_ids_arg):
+  """
+  Parse comma-separated object ids from CLI.
+
+  Examples:
+    --obj_ids 2,3
+    --obj_ids "1 5 6"
+    --obj_ids ""      -> run all objects
+  """
+  if obj_ids_arg is None:
+    return None
+  s = str(obj_ids_arg).strip()
+  if s == "" or s.lower() in ["all", "none", "null"]:
+    return None
+  s = s.replace(",", " ")
+  ids = []
+  for token in s.split():
+    token = token.strip()
+    if token == "":
+      continue
+    ids.append(int(token))
+  return sorted(set(ids))
+
+
 def make_reader(reader_cls, video_dir):
   """
   Create BOP reader safely.
@@ -272,7 +296,7 @@ def run_pose_estimation_worker(reader, i_frames, est: FoundationPose = None, deb
     est.gt_pose = reader.get_gt_pose(i_frame, ob_id)
 
     t0 = time.perf_counter()
-    pose = est.register(K=reader.K, rgb=color, depth=depth, ob_mask=ob_mask, ob_id=ob_id)
+    pose = est.register(K=reader.K, rgb=color, depth=depth, ob_mask=ob_mask, ob_id=ob_id, top_k=100, top_flag=True)
     runtime_sec = time.perf_counter() - t0
 
     # BOP CSV 的 score 是 confidence，不是 MSSD/MSPD/VSD/AR。
@@ -335,6 +359,26 @@ def run_pose_estimation():
   # 但 lmo/models_info.json 沒有 obj_000002，會造成 KeyError: '2'。
   reader_tmp = make_reader(ReaderClass, f'{test_root}/000002')
 
+  available_obj_ids = sorted([int(x) for x in reader_tmp.ob_ids])
+  requested_obj_ids = parse_obj_ids_arg(opt.obj_ids)
+  if requested_obj_ids is None:
+    run_obj_ids = available_obj_ids
+  else:
+    run_obj_ids = [oid for oid in available_obj_ids if oid in requested_obj_ids]
+    missing = [oid for oid in requested_obj_ids if oid not in available_obj_ids]
+    if len(missing) > 0:
+      logging.info(f"[OBJ_FILTER] requested obj_ids not available in dataset={dataset_name}: {missing}")
+    if len(run_obj_ids) == 0:
+      raise RuntimeError(
+        f"[OBJ_FILTER] No requested obj_ids exist in dataset={dataset_name}. "
+        f"requested={requested_obj_ids}, available={available_obj_ids}. "
+        f"Note: LMO object ids are usually [1,5,6,8,9,10,11,12], not 2/3."
+      )
+
+  logging.info(f"[OBJ_FILTER] available_obj_ids={available_obj_ids}")
+  logging.info(f"[OBJ_FILTER] requested_obj_ids={requested_obj_ids if requested_obj_ids is not None else 'ALL'}")
+  logging.info(f"[OBJ_FILTER] run_obj_ids={run_obj_ids}")
+
   res = NestDict()
   all_bop_rows = []
   glctx = dr.RasterizeCudaContext()
@@ -346,7 +390,7 @@ def run_pose_estimation():
   # Model-based only:
   # 強制使用 BOP models/obj_XXXXXX.ply，不使用 reconstructed mesh。
   # ============================================================
-  for ob_id in reader_tmp.ob_ids:
+  for ob_id in run_obj_ids:
     ob_id = int(ob_id)
 
     try:
@@ -384,6 +428,9 @@ def run_pose_estimation():
       if ob_id not in instance_ids:
         continue
       args.append((reader, [i], est, debug, ob_id, "cuda:0"))
+      if opt.max_frames_per_obj > 0 and len(args) >= opt.max_frames_per_obj:
+        logging.info(f"[FRAME_FILTER] ob_id={ob_id}: limit to max_frames_per_obj={opt.max_frames_per_obj}")
+        break
 
     logging.info(
       f"[RUN] ob_id={ob_id}, video_dir={video_dir}, video_id={video_id}, "
@@ -420,9 +467,12 @@ if __name__=='__main__':
   parser.add_argument('--debug_dir', type=str, default=f'{code_dir}/debug')
   parser.add_argument('--bop_result_name', type=str, default='', help='Output BOP CSV filename. Default: foundationpose_{dataset}-test.csv')
   parser.add_argument('--bop_time_mode', type=str, default='sum', choices=['sum', 'max', 'zero'], help='Make BOP time consistent per image: sum/max/zero')
+  parser.add_argument('--obj_ids', type=str, default='', help='Comma-separated object ids to run, e.g. "2,3". Empty or "all" means all objects.')
+  parser.add_argument('--max_frames_per_obj', type=int, default=0, help='Limit number of frames per object for quick tests. 0 means all frames.')
   opt = parser.parse_args()
   set_seed(0)
 
   detect_type = 'mask'   # mask / box / detected
 
   run_pose_estimation()
+  
