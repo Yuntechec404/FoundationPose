@@ -99,8 +99,6 @@ class FoundationPose:
       self.refiner.model.to(s)
     if self.scorer is not None:
       self.scorer.model.to(s)
-    if self.glctx is not None:
-      self.glctx = dr.RasterizeCudaContext(s)
 
   def _coarse_orientation_ok(self,ob_in_cam: np.ndarray,orientation_mode: str = "uniform",orientation_tilt_deg: float = 30.0,object_up_axis: int = 2):
     """
@@ -353,11 +351,6 @@ class FoundationPose:
     # still uses top_k after the refined scorer.
     depth_mode = str(getattr(self.refiner.cfg, 'depth_refine_mode', 'none')).lower() if hasattr(self.refiner, 'cfg') else 'none'
     if depth_mode not in ['none', 'off', 'false', '0'] and hasattr(self.refiner, 'depth_geometry_refine_poses'):
-      try:
-        torch.cuda.empty_cache()
-      except Exception:
-        pass
-
       actual_refine_top_k = int(max(1, min(int(top_k), len(poses))))
       original_topk = poses[:actual_refine_top_k]
 
@@ -367,7 +360,7 @@ class FoundationPose:
         rgb=rgb,
         depth=depth,
         K=K,
-        ob_in_cams=original_topk.data.cpu().numpy(),
+        ob_in_cams=original_topk,
         normal_map=normal_map,
         xyz_map=xyz_map,
         glctx=self.glctx,

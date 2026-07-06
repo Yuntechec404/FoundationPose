@@ -1,6 +1,7 @@
 depth_refine:
   mode: vgicp
-  apply: trans_z
+  apply: trans
   accept_if_better: true
   auto_sweep: true
+  nn_chunk: 1024
   log: true

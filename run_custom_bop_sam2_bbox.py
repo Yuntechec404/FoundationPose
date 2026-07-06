@@ -5,7 +5,6 @@ from Utils import *
 import json, uuid, joblib, os, sys
 import csv, time
 import glob, copy
-import scipy.spatial as spatial
 from multiprocessing import Pool
 import multiprocessing
 from functools import partial
@@ -110,6 +109,162 @@ def patch_bop_reader_filter_by_scene_gt():
 patch_bop_reader_filter_by_scene_gt()
 
 
+def find_bop_dataset_root(base_dir):
+  """
+  Walk upward from test/XXXXXX until a directory containing models/ is found.
+  """
+  root = os.path.abspath(base_dir)
+  while True:
+    if os.path.isdir(os.path.join(root, "models")):
+      return root
+    parent = os.path.dirname(root)
+    if parent == root:
+      raise FileNotFoundError(
+        f"Cannot find BOP dataset root containing models/ from base_dir={base_dir}"
+      )
+    root = parent
+
+
+def load_trimesh_force_mesh(mesh_file):
+  loaded = trimesh.load(mesh_file, force=None, process=False)
+  if isinstance(loaded, trimesh.Scene):
+    meshes = [
+      geom for geom in loaded.geometry.values()
+      if isinstance(geom, trimesh.Trimesh)
+    ]
+    if len(meshes) == 0:
+      raise RuntimeError(f"No triangle mesh found in {mesh_file}")
+    loaded = trimesh.util.concatenate(meshes)
+  if not isinstance(loaded, trimesh.Trimesh):
+    raise RuntimeError(
+      f"Unsupported mesh type={type(loaded)} for {mesh_file}"
+    )
+  return loaded
+
+
+class CustomBopReader(BopBaseReader):
+  """
+  Reader for the custom oil-palm BOP-style datasets.
+
+  Unlike LinemodReader, this reader:
+    1. derives object IDs from scene_gt.json,
+    2. does not hard-code LM/LM-O object IDs,
+    3. treats missing models_info.json as identity/no symmetry,
+    4. can auto-detect whether obj_XXXXXX.ply is stored in metres or mm.
+  """
+
+  def __init__(self, base_dir, zfar=np.inf, resize=1, split=None):
+    super().__init__(base_dir, zfar=zfar, resize=resize)
+    self.dataset_root = find_bop_dataset_root(base_dir)
+    self.dataset_name = os.path.basename(self.dataset_root).lower()
+    self.K = list(self.K_table.values())[0]
+
+    object_ids = set()
+    if self.scene_gt is not None:
+      for frame_items in self.scene_gt.values():
+        for item in frame_items:
+          object_ids.add(int(item["obj_id"]))
+    self.ob_ids = sorted(object_ids)
+
+    if len(self.ob_ids) == 0:
+      model_files = sorted(
+        glob.glob(os.path.join(self.dataset_root, "models", "obj_*.ply"))
+      )
+      for model_file in model_files:
+        stem = os.path.splitext(os.path.basename(model_file))[0]
+        self.ob_ids.append(int(stem.split("_")[-1]))
+      self.ob_ids = sorted(set(self.ob_ids))
+
+    self.ob_id_to_names = {
+      int(ob_id): f"obj_{int(ob_id):06d}" for ob_id in self.ob_ids
+    }
+
+    self.symmetry_tfs = {}
+    self.symmetry_info_table = {}
+    self.geometry_symmetry_info_table = {}
+
+    info_file = os.path.join(
+      self.dataset_root, "models", "models_info.json"
+    )
+    models_info = {}
+    if os.path.isfile(info_file):
+      with open(info_file, "r") as file:
+        models_info = json.load(file)
+
+    for ob_id in self.ob_ids:
+      info = models_info.get(str(ob_id), {})
+      self.symmetry_info_table[ob_id] = copy.deepcopy(info)
+      self.geometry_symmetry_info_table[ob_id] = copy.deepcopy(info)
+      if info:
+        self.symmetry_tfs[ob_id] = symmetry_tfs_from_info(
+          info,
+          rot_angle_discrete=5,
+        )
+      else:
+        self.symmetry_tfs[ob_id] = np.eye(
+          4,
+          dtype=np.float32,
+        ).reshape(1, 4, 4)
+
+    logging.info(
+      f"[CustomBopReader] scene={base_dir}, "
+      f"object_ids={self.ob_ids}, "
+      f"models_info={'yes' if models_info else 'no (identity symmetry)'}"
+    )
+
+  def get_gt_mesh_file(self, ob_id):
+    mesh_file = os.path.join(
+      self.dataset_root,
+      "models",
+      f"obj_{int(ob_id):06d}.ply",
+    )
+    if not os.path.isfile(mesh_file):
+      raise FileNotFoundError(mesh_file)
+    return mesh_file
+
+  def get_gt_mesh(self, ob_id):
+    mesh_file = self.get_gt_mesh_file(ob_id)
+    mesh = load_trimesh_force_mesh(mesh_file).copy()
+
+    model_unit = str(
+      getattr(opt, "custom_model_unit", "auto")
+    ).lower()
+    max_extent = float(np.max(mesh.extents))
+
+    if model_unit == "mm":
+      scale = 1e-3
+      detected = "forced_mm"
+    elif model_unit == "m":
+      scale = 1.0
+      detected = "forced_m"
+    elif model_unit == "auto":
+      # BOP models are usually stored in millimetres. Your generated model
+      # currently has extents around 0.05~0.07, so it is already in metres.
+      if max_extent > 2.0:
+        scale = 1e-3
+        detected = "auto_mm"
+      else:
+        scale = 1.0
+        detected = "auto_m"
+    else:
+      raise ValueError(
+        f"Unknown --custom_model_unit={model_unit}; use auto,m,mm"
+      )
+
+    mesh.vertices = np.asarray(
+      mesh.vertices,
+      dtype=np.float64,
+    ) * scale
+
+    logging.info(
+      f"[CustomBopReader] mesh={mesh_file}, "
+      f"source_max_extent={max_extent:.6f}, "
+      f"unit={detected}, scale_to_m={scale}, "
+      f"final_extents_m={mesh.extents.tolist()}"
+    )
+    return mesh
+
+
 def infer_bop_dataset_name(dataset_root):
   return os.path.basename(os.path.abspath(dataset_root)).lower()
 
@@ -118,7 +273,9 @@ def get_bop_reader_class(dataset_name):
   dataset_name = str(dataset_name).lower()
   if dataset_name == 'lmo' and 'LinemodOcclusionReader' in globals():
     return LinemodOcclusionReader
-  return LinemodReader
+  if dataset_name in ['lm', 'linemod']:
+    return LinemodReader
+  return CustomBopReader
 
 
 def parse_obj_ids_arg(obj_ids_arg):
@@ -136,6 +293,33 @@ def parse_obj_ids_arg(obj_ids_arg):
     ids.append(int(token))
   return sorted(set(ids))
 
+
+
+
+def parse_scene_ids_arg(scene_ids_arg, available_scene_dirs):
+  available = {
+    int(os.path.basename(path.rstrip("/"))): path
+    for path in available_scene_dirs
+  }
+
+  if scene_ids_arg is None:
+    return [available[key] for key in sorted(available)]
+
+  value = str(scene_ids_arg).strip().lower()
+  if value in ["", "all", "*"]:
+    return [available[key] for key in sorted(available)]
+
+  requested = []
+  for token in value.replace(",", " ").split():
+    requested.append(int(token))
+
+  missing = [scene_id for scene_id in requested if scene_id not in available]
+  if missing:
+    raise RuntimeError(
+      f"Requested scene IDs do not exist: {missing}; "
+      f"available={sorted(available)}"
+    )
+  return [available[scene_id] for scene_id in requested]
 
 
 
@@ -803,6 +987,8 @@ def run_pose_estimation_worker(reader, i_frames, est: FoundationPose = None, deb
     color = reader.get_color(i_frame)
     depth = reader.get_depth(i_frame)
     id_str = reader.id_strs[i_frame]
+    if hasattr(reader, "get_K"):
+      reader.K = reader.get_K(i_frame)
     H, W = color.shape[:2]
 
     gt_mask_raw = reader.get_mask(i_frame, ob_id)
@@ -1040,58 +1226,119 @@ def run_pose_estimation():
   if not os.path.isdir(test_root):
     raise FileNotFoundError(f"Cannot find test root: {test_root}")
 
+  all_scene_dirs = sorted(
+    path for path in glob.glob(f"{test_root}/*")
+    if os.path.isdir(path)
+    and os.path.basename(path).isdigit()
+  )
+  if len(all_scene_dirs) == 0:
+    raise RuntimeError(f"No numeric BOP scene directory found under {test_root}")
+
+  selected_scene_dirs = parse_scene_ids_arg(
+    opt.scene_ids,
+    all_scene_dirs,
+  )
+
   debug = opt.debug
   debug_dir = opt.debug_dir
   os.makedirs(debug_dir, exist_ok=True)
 
   dataset_name = infer_bop_dataset_name(opt.linemod_dir)
   ReaderClass = get_bop_reader_class(dataset_name)
-  logging.info(f"[INFO] dataset={dataset_name}, reader={ReaderClass.__name__}")
+  logging.info(
+    f"[INFO] dataset={dataset_name}, reader={ReaderClass.__name__}, "
+    f"scenes={[os.path.basename(x) for x in selected_scene_dirs]}"
+  )
 
-  reader_tmp = make_reader(ReaderClass, f'{test_root}/000002')
+  scene_readers = []
+  available_obj_ids = set()
+  for scene_dir in selected_scene_dirs:
+    reader = make_reader(ReaderClass, scene_dir)
+    scene_readers.append(reader)
+    available_obj_ids.update(int(x) for x in reader.ob_ids)
 
-  available_obj_ids = sorted([int(x) for x in reader_tmp.ob_ids])
+  available_obj_ids = sorted(available_obj_ids)
   requested_obj_ids = parse_obj_ids_arg(opt.obj_ids)
   if requested_obj_ids is None:
     run_obj_ids = available_obj_ids
   else:
-    run_obj_ids = [oid for oid in available_obj_ids if oid in requested_obj_ids]
-    missing = [oid for oid in requested_obj_ids if oid not in available_obj_ids]
+    run_obj_ids = [
+      oid for oid in available_obj_ids
+      if oid in requested_obj_ids
+    ]
+    missing = [
+      oid for oid in requested_obj_ids
+      if oid not in available_obj_ids
+    ]
     if len(missing) > 0:
-      logging.info(f"[OBJ_FILTER] requested obj_ids not available in dataset={dataset_name}: {missing}")
+      logging.info(
+        f"[OBJ_FILTER] requested object IDs not present: {missing}"
+      )
     if len(run_obj_ids) == 0:
       raise RuntimeError(
-        f"[OBJ_FILTER] No requested obj_ids exist in dataset={dataset_name}. "
-        f"requested={requested_obj_ids}, available={available_obj_ids}. "
-        f"Note: LMO object ids are usually [1,5,6,8,9,10,11,12], not 2/3."
+        f"No requested object IDs exist. "
+        f"requested={requested_obj_ids}, "
+        f"available={available_obj_ids}"
       )
 
-  mask_sources = parse_str_list(opt.mask_sources, default=["gt", "sam2", "sam2_geo"])
-  depth_modes = parse_str_list(opt.depth_refine_modes, default=["none", "icp", "ndt", "gicp", "vgicp"])
-  depth_applies = parse_depth_refine_applies(opt.depth_refine_apply, default=["trans_z"])
-  mode_apply_pairs = iter_depth_refine_mode_apply(depth_modes, depth_applies)
+  mask_sources = parse_str_list(
+    opt.mask_sources,
+    default=["gt", "sam2", "sam2_geo"],
+  )
+  depth_modes = parse_str_list(
+    opt.depth_refine_modes,
+    default=["none", "icp", "ndt", "gicp", "vgicp"],
+  )
+  depth_applies = parse_depth_refine_applies(
+    opt.depth_refine_apply,
+    default=["trans_z"],
+  )
+  mode_apply_pairs = iter_depth_refine_mode_apply(
+    depth_modes,
+    depth_applies,
+  )
+
   valid_mask_sources = {"gt", "sam2", "bbox", "sam2_geo"}
-  for ms in mask_sources:
-    if ms not in valid_mask_sources:
-      raise ValueError(f"Unknown mask_source={ms}. Use gt,sam2,bbox,sam2_geo")
+  for mask_source in mask_sources:
+    if mask_source not in valid_mask_sources:
+      raise ValueError(
+        f"Unknown mask_source={mask_source}. "
+        "Use gt,sam2,bbox,sam2_geo"
+      )
 
   logging.info(f"[OBJ_FILTER] available_obj_ids={available_obj_ids}")
-  logging.info(f"[OBJ_FILTER] requested_obj_ids={requested_obj_ids if requested_obj_ids is not None else 'ALL'}")
+  logging.info(
+    f"[OBJ_FILTER] requested_obj_ids="
+    f"{requested_obj_ids if requested_obj_ids is not None else 'ALL'}"
+  )
   logging.info(f"[OBJ_FILTER] run_obj_ids={run_obj_ids}")
   logging.info(f"[ABLATION] mask_sources={mask_sources}")
-  logging.info(f"[ABLATION] depth_refine_modes={depth_modes}, applies={depth_applies}")
+  logging.info(
+    f"[ABLATION] depth_refine_modes={depth_modes}, "
+    f"applies={depth_applies}"
+  )
   logging.info(f"[ABLATION] mode_apply_pairs={mode_apply_pairs}")
-  logging.info(f"[SAM2] ckpt={opt.sam_ckpt}, imgsz={opt.sam_imgsz}, bbox_expand={opt.bbox_expand}")
+  logging.info(
+    f"[SAM2] ckpt={opt.sam_ckpt}, imgsz={opt.sam_imgsz}, "
+    f"bbox_expand={opt.bbox_expand}"
+  )
 
   sam2_model = None
   if ("sam2" in mask_sources) or ("sam2_geo" in mask_sources):
-    sam2_model = load_sam2_model(opt.sam_ckpt, imgsz=opt.sam_imgsz)
+    sam2_model = load_sam2_model(
+      opt.sam_ckpt,
+      imgsz=opt.sam_imgsz,
+    )
 
   res = NestDict()
   rows_by_exp = {}
   mask_metric_rows = []
+
   glctx = dr.RasterizeCudaContext(device="cuda:0")
-  mesh_tmp = trimesh.primitives.Box(extents=np.ones((3)), transform=np.eye(4)).to_mesh()
+  mesh_tmp = trimesh.primitives.Box(
+    extents=np.ones((3)),
+    transform=np.eye(4),
+  ).to_mesh()
 
   est = FoundationPose(
     model_pts=mesh_tmp.vertices.copy(),
@@ -1105,103 +1352,134 @@ def run_pose_estimation():
     debug=debug,
   )
 
-  est.to_device("cuda:0")
-
-  for ob_id in run_obj_ids:
-    ob_id = int(ob_id)
-
-    try:
-      mesh = reader_tmp.get_gt_mesh(ob_id)
-      symmetry_tfs = reader_tmp.symmetry_tfs[ob_id]
-    except Exception as e:
-      logging.info(f"[SKIP] ob_id={ob_id}: cannot load model-based mesh/symmetry. error={e}")
-      continue
-
-    if dataset_name == 'lmo':
-      video_dir = f'{test_root}/000002'
-    else:
-      candidate_video_dir = f'{test_root}/{ob_id:06d}'
-      if os.path.isdir(candidate_video_dir):
-        video_dir = candidate_video_dir
-      else:
-        video_dir = f'{test_root}/000002'
-
-    reader = make_reader(ReaderClass, video_dir)
+  for reader in scene_readers:
+    video_dir = reader.base_dir
     video_id = reader.get_video_id()
-
-    est.reset_object(
-      model_pts=mesh.vertices.copy(),
-      model_normals=mesh.vertex_normals.copy(),
-      symmetry_tfs=symmetry_tfs,
-      mesh=mesh,
+    scene_obj_ids = sorted(
+      set(int(x) for x in reader.ob_ids).intersection(run_obj_ids)
     )
-    est.to_device("cuda:0")
-
-    args = []
-    for i in range(len(reader.color_files)):
-      instance_ids = reader.get_instance_ids_in_image(i)
-      if ob_id not in instance_ids:
-        continue
-      args.append((reader, [i], est, debug, ob_id, "cuda:0"))
-      if opt.max_frames_per_obj > 0 and len(args) >= opt.max_frames_per_obj:
-        logging.info(f"[FRAME_FILTER] ob_id={ob_id}: limit to max_frames_per_obj={opt.max_frames_per_obj}")
-        break
 
     logging.info(
-      f"[RUN] ob_id={ob_id}, video_dir={video_dir}, video_id={video_id}, "
-      f"frames_with_obj={len(args)}"
+      f"[SCENE] video_dir={video_dir}, video_id={video_id}, "
+      f"scene_obj_ids={scene_obj_ids}"
     )
 
-    outs = []
-    for arg in args:
-      out, rows_by_exp, mask_metric_rows = run_pose_estimation_worker(
-        *arg,
-        sam2_model=sam2_model,
-        dataset_name=dataset_name,
-        rows_by_exp=rows_by_exp,
-        mask_metric_rows=mask_metric_rows,
+    for ob_id in scene_obj_ids:
+      try:
+        mesh = reader.get_gt_mesh(ob_id)
+        symmetry_tfs = reader.symmetry_tfs.get(
+          ob_id,
+          np.eye(4, dtype=np.float32).reshape(1, 4, 4),
+        )
+      except Exception as error:
+        logging.info(
+          f"[SKIP] scene={video_id}, ob_id={ob_id}: "
+          f"cannot load mesh/symmetry. error={error}"
+        )
+        continue
+
+      est.reset_object(
+        model_pts=mesh.vertices.copy(),
+        model_normals=mesh.vertex_normals.copy(),
+        symmetry_tfs=symmetry_tfs,
+        mesh=mesh,
       )
-      outs.append(out)
 
-    for out in outs:
-      for video_id in out:
-        for id_str in out[video_id]:
-          for _ob_id in out[video_id][id_str]:
-            res[video_id][id_str][_ob_id] = out[video_id][id_str][_ob_id]
+      frame_args = []
+      for frame_index in range(len(reader.color_files)):
+        instance_ids = reader.get_instance_ids_in_image(frame_index)
+        if ob_id not in instance_ids:
+          continue
 
-  with open(f'{opt.debug_dir}/linemod_res.yml', 'w') as ff:
-    yaml.safe_dump(make_yaml_dumpable(res), ff)
+        frame_args.append(
+          (reader, [frame_index], est, debug, ob_id, "cuda:0")
+        )
+        if (
+          opt.max_frames_per_obj > 0
+          and len(frame_args) >= opt.max_frames_per_obj
+        ):
+          logging.info(
+            f"[FRAME_FILTER] scene={video_id}, ob_id={ob_id}: "
+            f"limit={opt.max_frames_per_obj}"
+          )
+          break
 
-  # Write one BOP CSV per experiment folder, compatible with eval_bop_refine.sh.
+      logging.info(
+        f"[RUN] scene={video_id}, ob_id={ob_id}, "
+        f"frames_with_obj={len(frame_args)}"
+      )
+
+      for frame_arg in frame_args:
+        out, rows_by_exp, mask_metric_rows = run_pose_estimation_worker(
+          *frame_arg,
+          sam2_model=sam2_model,
+          dataset_name=dataset_name,
+          rows_by_exp=rows_by_exp,
+          mask_metric_rows=mask_metric_rows,
+        )
+
+        for result_video_id in out:
+          for id_str in out[result_video_id]:
+            for result_ob_id in out[result_video_id][id_str]:
+              res[result_video_id][id_str][result_ob_id] = (
+                out[result_video_id][id_str][result_ob_id]
+              )
+
+  with open(f'{opt.debug_dir}/linemod_res.yml', 'w') as file:
+    yaml.safe_dump(make_yaml_dumpable(res), file)
+
   for exp_name, rows in sorted(rows_by_exp.items()):
     exp_dir = os.path.join(opt.debug_dir, exp_name)
-    csv_name = opt.bop_result_name if opt.bop_result_name else f"foundationpose_{dataset_name}-test.csv"
+    csv_name = (
+      opt.bop_result_name
+      if opt.bop_result_name
+      else f"foundationpose_{dataset_name}-test.csv"
+    )
     csv_path = os.path.join(exp_dir, csv_name)
-    write_bop_results_csv(csv_path, rows, time_mode=opt.bop_time_mode)
+    write_bop_results_csv(
+      csv_path,
+      rows,
+      time_mode=opt.bop_time_mode,
+    )
 
-  write_dict_rows_csv(os.path.join(opt.debug_dir, "segmentation_metrics.csv"), mask_metric_rows)
+  write_dict_rows_csv(
+    os.path.join(opt.debug_dir, "segmentation_metrics.csv"),
+    mask_metric_rows,
+  )
   summarize_segmentation_metrics(mask_metric_rows, opt.debug_dir)
-  write_experiment_metadata(opt.debug_dir, dataset_name, mask_sources, depth_modes, depth_applies)
+  write_experiment_metadata(
+    opt.debug_dir,
+    dataset_name,
+    mask_sources,
+    depth_modes,
+    depth_applies,
+  )
 
-  logging.info(f"[DONE] result saved to {opt.debug_dir}/linemod_res.yml")
-  logging.info(f"[DONE] experiments saved under {opt.debug_dir}")
+  logging.info(
+    f"[DONE] result saved to {opt.debug_dir}/linemod_res.yml"
+  )
+  logging.info(
+    f"[DONE] experiments saved under {opt.debug_dir}"
+  )
 
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser()
   code_dir = os.path.dirname(os.path.realpath(__file__))
-  parser.add_argument('--linemod_dir', type=str, default="/home/user/FoundationPose/demo_data/bop/lm", help="BOP LM or LMO root dir, e.g. /home/user/FoundationPose/demo_data/bop/lm")
+  parser.add_argument('--linemod_dir', type=str, default="/home/user/FoundationPose/demo_data/bop/lmo", help="BOP dataset root containing models/ and test/")
+  parser.add_argument('--scene_ids', type=str, default='all', help='Comma-separated scene IDs such as 1,2. Default: all numeric test scenes.')
+  parser.add_argument('--custom_model_unit', type=str, default='auto', choices=['auto','m','mm'], help='Unit used by custom models/obj_XXXXXX.ply. auto keeps small metre-scale meshes and converts large mm-scale meshes.')
   parser.add_argument('--debug', type=int, default=0)
-  parser.add_argument('--debug_dir', type=str, default=f'{code_dir}/debug_sam2_gpu')
+  parser.add_argument('--debug_dir', type=str, default=f'{code_dir}/debug_sam2_2')
   parser.add_argument('--bop_result_name', type=str, default='', help='Output BOP CSV filename. Default: foundationpose_{dataset}-test.csv')
   parser.add_argument('--bop_time_mode', type=str, default='sum', choices=['sum', 'max', 'zero'], help='Make BOP time consistent per image: sum/max/zero')
   parser.add_argument('--obj_ids', type=str, default='', help='Comma-separated object ids to run, e.g. "1,5". Empty or "all" means all objects.')
   parser.add_argument('--max_frames_per_obj', type=int, default=5, help='Limit number of frames per object for quick tests. 0 means all frames.')
 
   # New ablation controls.
-  parser.add_argument('--mask_sources', type=str, default='gt', help='Comma-separated mask sources to run FoundationPose with: gt,sam2,bbox,sam2_geo')
+  parser.add_argument('--mask_sources', type=str, default='gt,sam2,sam2_geo', help='Comma-separated mask sources to run FoundationPose with: gt,sam2,bbox,sam2_geo')
   parser.add_argument('--depth_refine_modes', type=str, default='none,icp,ndt,gicp,vgicp', help='Comma-separated depth refine modes: none,icp,ndt,gicp,vgicp')
-  parser.add_argument('--depth_refine_apply', type=str, default='trans', help='Comma-separated apply modes: trans,trans_z,se3, or all. Example: --depth_refine_apply all')
+  parser.add_argument('--depth_refine_apply', type=str, default='trans,trans_z', help='Comma-separated apply modes: trans,trans_z,se3, or all. Example: --depth_refine_apply all')
   parser.add_argument('--top_k', type=int, default=50, help='FoundationPose register top_k.')
   parser.add_argument('--top_flag', action='store_true', default=True, help='Use top-k filtering before RefineNet/scorer if estimater.py supports it.')
   parser.add_argument('--no_top_flag', dest='top_flag', action='store_false', help='Disable top_flag.')
@@ -1241,3 +1519,4 @@ if __name__ == '__main__':
   set_seed(0)
 
   run_pose_estimation()
+  

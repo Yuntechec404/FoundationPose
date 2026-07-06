@@ -3,12 +3,42 @@
 
 import argparse, time, statistics, subprocess, shlex, re, sys, os, csv, datetime
 from typing import Dict, List, Tuple, Optional
+import select
+import termios
+import tty
+from contextlib import contextmanager, nullcontext
 
 try:
     import psutil
 except ImportError:
     print("請先安裝 psutil：  python3 -m pip install psutil", file=sys.stderr)
     sys.exit(1)
+
+@contextmanager
+def raw_stdin():
+    """
+    讓 stdin 進入 raw mode，方便即時讀鍵。
+    結束時會自動還原。
+    """
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)  # 比 raw 更溫和，但足夠即時讀鍵
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+def q_pressed() -> bool:
+    """
+    非阻塞檢查 stdin 是否有按鍵；若讀到 q/Q 回 True。
+    """
+    try:
+        if select.select([sys.stdin], [], [], 0.0)[0]:
+            ch = sys.stdin.read(1)
+            return ch in ("q", "Q")
+    except Exception:
+        pass
+    return False
 
 def run(cmd: str, timeout: int = 5, force_c_locale: bool = False) -> str:
     try:
@@ -152,7 +182,7 @@ def append_csv_rows(path: str, fieldnames: List[str], rows: List[Dict[str, objec
 def main():
     ap = argparse.ArgumentParser(description="收集系統效能指標；逐偵紀錄並存 CSV（含最終平均；GPU 使用 nvidia-smi）")
     ap.add_argument("--label", required=True, help="場景標籤（例如：空載/未貼皮/貼皮）")
-    ap.add_argument("--duration", type=float, default=20.0, help="量測秒數（預設 20s）")
+    ap.add_argument("--duration", type=float, default=20.0, help="量測秒數；-1 表示直到按 q 停止（預設 20s）")
     ap.add_argument("--interval", type=float, default=1.0, help="取樣間隔秒（預設 1s）")
     ap.add_argument("--gpu-index", type=int, default=0, help="nvidia-smi GPU index（預設 0）")
     ap.add_argument("--proc", action="append", default=[],
@@ -205,73 +235,83 @@ def main():
         cpu_core_temps_all.extend(sx0["cpu_core_temps"])
     if "cpu_fan_rpm" in sx0:
         cpu_fan_samples.append(float(sx0["cpu_fan_rpm"]))
+    
+    infinite = (args.duration is not None and args.duration < 0)
+    if infinite:
+        print("duration = -1：開始無限量測，按下 q 鍵停止。")
 
-    while True:
-        now = time.time()
-        elapsed = now - t_start
-        if elapsed >= args.duration:
-            break
+    ctx = raw_stdin() if infinite else nullcontext()
+    with ctx:
+        while True:
+            now = time.time()
+            elapsed = now - t_start
+            if infinite:
+                if q_pressed():
+                    print("\n收到 q，停止量測。")
+                    break
+            else:
+                if elapsed >= args.duration:
+                    break
+            # CPU
+            cpu_usage = get_cpu_usage_sample()
+            cpu_usage_samples.append(cpu_usage)
 
-        # CPU
-        cpu_usage = get_cpu_usage_sample()
-        cpu_usage_samples.append(cpu_usage)
+            cpu_freq = get_cpu_freq_mhz()
+            if cpu_freq is not None:
+                cpu_freq_samples.append(cpu_freq)
 
-        cpu_freq = get_cpu_freq_mhz()
-        if cpu_freq is not None:
-            cpu_freq_samples.append(cpu_freq)
+            sx = parse_sensors()
+            temps_sample = sx.get("cpu_core_temps", [])
+            if isinstance(temps_sample, list) and temps_sample:
+                cpu_core_temps_all.extend(temps_sample)
+                frame_cpu_temp_min.append(min(temps_sample))
+                frame_cpu_temp_max.append(max(temps_sample))
+                cpu_temp_min = min(temps_sample)
+                cpu_temp_max = max(temps_sample)
+            else:
+                cpu_temp_min = None
+                cpu_temp_max = None
 
-        sx = parse_sensors()
-        temps_sample = sx.get("cpu_core_temps", [])
-        if isinstance(temps_sample, list) and temps_sample:
-            cpu_core_temps_all.extend(temps_sample)
-            frame_cpu_temp_min.append(min(temps_sample))
-            frame_cpu_temp_max.append(max(temps_sample))
-            cpu_temp_min = min(temps_sample)
-            cpu_temp_max = max(temps_sample)
-        else:
-            cpu_temp_min = None
-            cpu_temp_max = None
+            cpu_fan = sx.get("cpu_fan_rpm", None)
+            if cpu_fan is not None:
+                f = float(cpu_fan)
+                cpu_fan_samples.append(f)
+                cpu_fan = int(f)
 
-        cpu_fan = sx.get("cpu_fan_rpm", None)
-        if cpu_fan is not None:
-            f = float(cpu_fan)
-            cpu_fan_samples.append(f)
-            cpu_fan = int(f)
+            # GPU
+            g_util, g_temp, g_fan_text = get_gpu_stats(args.gpu_index)
+            if g_util is not None: gpu_usage_samples.append(g_util)
+            if g_temp is not None: gpu_temp_samples.append(g_temp)
+            if g_fan_text is not None: gpu_fan_texts.append(g_fan_text)
 
-        # GPU
-        g_util, g_temp, g_fan_text = get_gpu_stats(args.gpu_index)
-        if g_util is not None: gpu_usage_samples.append(g_util)
-        if g_temp is not None: gpu_temp_samples.append(g_temp)
-        if g_fan_text is not None: gpu_fan_texts.append(g_fan_text)
+            # Processes（逐偵）
+            proc_sample_vals: Dict[str, float] = {}
+            for lbl, pat in proc_specs:
+                v = match_proc_cpu_percent(pat)
+                proc_sample_vals[lbl] = v
+                proc_cpu_series[lbl].append(v)
 
-        # Processes（逐偵）
-        proc_sample_vals: Dict[str, float] = {}
-        for lbl, pat in proc_specs:
-            v = match_proc_cpu_percent(pat)
-            proc_sample_vals[lbl] = v
-            proc_cpu_series[lbl].append(v)
+            # 逐偵 CSV 列
+            csv_row: Dict[str, object] = {
+                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                "label": args.label,
+                "elapsed_s": round(elapsed, 3),
+                "battery": battery_state,
+                "cpu_usage_percent": round(cpu_usage, 2) if cpu_usage is not None else "N/A",
+                "cpu_freq_mhz": round(cpu_freq, 4) if cpu_freq is not None else "N/A",
+                "cpu_fan_rpm": cpu_fan if cpu_fan is not None else "N/A",
+                "cpu_temp_min_c": round(cpu_temp_min, 1) if cpu_temp_min is not None else "N/A",
+                "cpu_temp_max_c": round(cpu_temp_max, 1) if cpu_temp_max is not None else "N/A",
+                "gpu_util_percent": round(g_util, 2) if g_util is not None else "N/A",
+                "gpu_temp_c": round(g_temp, 1) if g_temp is not None else "N/A",
+                "gpu_fan": g_fan_text if g_fan_text is not None else "N/A",
+            }
+            for lbl in [k for k,_ in proc_specs]:
+                v = proc_sample_vals.get(lbl, None)
+                csv_row[f"{lbl}_cpu_percent"] = round(v, 2) if v is not None else "N/A"
 
-        # 逐偵 CSV 列
-        csv_row: Dict[str, object] = {
-            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
-            "label": args.label,
-            "elapsed_s": round(elapsed, 3),
-            "battery": battery_state,
-            "cpu_usage_percent": round(cpu_usage, 2) if cpu_usage is not None else "N/A",
-            "cpu_freq_mhz": round(cpu_freq, 4) if cpu_freq is not None else "N/A",
-            "cpu_fan_rpm": cpu_fan if cpu_fan is not None else "N/A",
-            "cpu_temp_min_c": round(cpu_temp_min, 1) if cpu_temp_min is not None else "N/A",
-            "cpu_temp_max_c": round(cpu_temp_max, 1) if cpu_temp_max is not None else "N/A",
-            "gpu_util_percent": round(g_util, 2) if g_util is not None else "N/A",
-            "gpu_temp_c": round(g_temp, 1) if g_temp is not None else "N/A",
-            "gpu_fan": g_fan_text if g_fan_text is not None else "N/A",
-        }
-        for lbl in [k for k,_ in proc_specs]:
-            v = proc_sample_vals.get(lbl, None)
-            csv_row[f"{lbl}_cpu_percent"] = round(v, 2) if v is not None else "N/A"
-
-        csv_rows.append(csv_row)
-        time.sleep(max(0.0, args.interval))
+            csv_rows.append(csv_row)
+            time.sleep(max(0.0, args.interval))
 
     # ====== 彙整平均 ======
     cpu_temp_global_min, cpu_temp_global_max = minmax_or_na(cpu_core_temps_all)
@@ -358,8 +398,8 @@ if __name__ == "__main__":
 # python3 -m pip install --upgrade psutil
 
 # 例：foundationpose 場景，逐偵 + 平均一起寫入 CSV（英文電池狀態避免亂碼）
-# ./collect_perf.py --label foundationpose --gpu-index 0 --duration 30 --interval 1 --proc "python3=foundationpose_" --battery-en --csv perf_foundationpose.csv
+# ./collect_perf.py --label foundationpose --gpu-index 0 --duration -1 --interval 1 --proc "python3=foundationpose_" --battery-en --csv perf_foundationpose.csv
 
 # 例：megapose 追加到同一檔
-# ./collect_perf.py --label megapose貼皮 --gpu-index 0 --duration 60 --interval 1 --proc "python3=foundationpose_" --proc "MegaPoseClient=megaposeclient" --battery-en --csv perf_foundationpose.csv --csv-append
+# ./collect_perf.py --label megapose貼皮 --gpu-index 0 --duration -1 --interval 1 --proc "python3=foundationpose_" --proc "MegaPoseClient=megaposeclient" --battery-en --csv perf_foundationpose.csv --csv-append
 
