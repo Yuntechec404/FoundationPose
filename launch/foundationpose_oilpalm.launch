@@ -16,7 +16,7 @@
   <!-- ===================== YOLO / YOLO-seg ===================== -->
   <!-- <arg name="det_model"        default="$(find ros_foundationpose)/data/bunch_stem-seg.onnx"/>  -->
   <!-- YOLO segmentation 模型 -->
-  <arg name="det_model"        default="$(find ros_foundationpose)/data/oilpalm_stem.onnx"/> 
+  <arg name="det_model"        default="$(find ros_foundationpose)/data/oilpalm_stem_new.onnx"/> 
   <!-- YOLO detection 模型 -->
 
   <!-- ===================== SAM / SAM2 /FastSAM ===================== -->
@@ -41,13 +41,14 @@
   <arg name="det_select_mode" default="score"/> <!-- bbox 選擇策略：middle | score |nearest_depth -->
   
   <!-- ===================== Pose Estimation / Tracking ===================== -->
+  <arg name="est_top_k"  default="5"/> <!-- 初始化 pose top-x -->
   <arg name="est_refine_iter"  default="5"/> <!-- 初始化 pose refine 次數 -->
   <arg name="track_refine_iter" default="2"/> <!-- tracking 時 refine 次數 -->
 
   <!-- ===================== Coarse Initial Pose Sampling ===================== -->
   <arg name="coarse_min_n_views"              default="40"/> <!-- icosphere 最少視角數；40 通常會產生 42 個視角 -->
   <arg name="coarse_inplane_step"             default="60"/> <!-- 平面內旋轉間隔；60=6 rotations，30=12 rotations -->
-  <arg name="coarse_orientation_mode"         default="upright"/> <!-- uniform / upright / inverted -->
+  <arg name="coarse_orientation_mode"         default="inverted"/> <!-- uniform / upright / inverted -->
   <arg name="coarse_orientation_tilt_deg"     default="80.0"/> <!-- 正放/倒放允許傾斜角度，單位 deg -->
   <arg name="coarse_object_up_axis"           default="1"/> <!-- 0=X, 1=Y, 2=Z；目前定義綠色 Y 軸為判斷軸 -->
   
@@ -95,6 +96,7 @@
     <param name="det_select_mode"  value="$(arg det_select_mode)"/>
     <param name="init_det_patience" value="$(arg init_det_patience)"/>
 
+    <param name="est_top_k"   value="$(arg est_top_k)"/>
     <param name="est_refine_iter"   value="$(arg est_refine_iter)"/>
     <param name="track_refine_iter" value="$(arg track_refine_iter)"/>
 

@@ -186,6 +186,7 @@ class FoundationPoseTracker:
         self.det_conf = float(gp("det_conf", 0.25))
         self.det_class = int(gp("det_class", -1))
         self.init_det_patience = int(gp("init_det_patience", 3))
+        self.est_top_k = int(gp("est_top_k", 5))
         self.est_refine_iter = int(gp("est_refine_iter", 5))
         self.track_refine_iter = int(gp("track_refine_iter", 2))
 
@@ -701,7 +702,7 @@ class FoundationPoseTracker:
         mask = self.get_segmentation_mask(color, depth, det_xyxy, det_mask_data)
         
         t0 = time.perf_counter()
-        pose = est.register(K=K, rgb=color, depth=depth, ob_mask=mask, iteration=est_refine_iter)
+        pose = est.register(K=K, rgb=color, depth=depth, ob_mask=mask, iteration=est_refine_iter, top_k=self.est_top_k)
         if self.perf_eval_enable: 
             self.time_init = (time.perf_counter() - t0) * 1000.0
 
@@ -877,7 +878,7 @@ class FoundationPoseTracker:
                     else:
                         self.mask = self.create_mask(self.depth_m, box_points)
                         t0 = time.perf_counter()
-                        self.pose = self.est.register(K=self.K, rgb=self.color, depth=self.depth_m, ob_mask=self.mask, iteration=self.est_refine_iter)
+                        self.pose = self.est.register(K=self.K, rgb=self.color, depth=self.depth_m, ob_mask=self.mask, iteration=self.est_refine_iter, top_k=self.est_top_k)
                         if self.perf_eval_enable: 
                             self.time_init = (time.perf_counter() - t0) * 1000.0
                             self.time_det = 0.0

@@ -2,7 +2,6 @@
   <arg name="image_topic" default="/camera/color/image_raw"/>
   <arg name="info_topic" default="/camera/color/camera_info"/>
   <arg name="depth_topic" default="/camera/aligned_depth_to_color/image_raw"/>
-  <arg name="depth_info_topic" default=""/>
   <!-- 彩色影像、對齊後的深度圖、相機內參的Topic -->
   <arg name="camera_tf" default="camera_color_optical_frame"/>
   <!-- 相機的TF座標系 -->
@@ -12,8 +11,9 @@
   <arg name="mesh_file" default="$(find ros_foundationpose)/data/oilpalm/oilpalm.obj"/> 
   <!-- 果串的 3D 模型檔 (.obj) -->
   <arg name="debug_dir" default="$(find ros_foundationpose)/log"/>
+  <arg name="self_eval_log" default="false"/>
 
-  <arg name="det_model" default="$(find ros_foundationpose)/data/oilpalm_stem.onnx"/>
+  <arg name="det_model" default="$(find ros_foundationpose)/data/oilpalm_stem_new.onnx"/>
   <!-- YOLO detection模型的權重檔 -->
   <arg name="seg_model" default="$(find ros_foundationpose)/data/bunch_stem-seg.pt"/>
   <!-- YOLOv11-seg模型的權重路徑 -->
@@ -33,27 +33,41 @@
 
   <arg name="det_conf" default="0.25"/>
   <!-- YOLO 的信心度閾值 -->
-  <arg name="det_class" default="-1"/>
   <arg name="det_imgsz" default="640"/>
   <arg name="det_select_mode" default="nearest_depth"/>
   <!-- YOLO的挑選策略 score / middle / nearest_depth -->
 
+  <arg name="init_det_patience" default="15"/>
+  <!-- YOLO 需連續穩定偵測 N 幀，才進行分割與 FoundationPose 初始化。 -->
+  <arg name="est_top_k" default="40"/>
+  <!-- FoundationPose 初始化保留的最佳候選姿態數。 -->
   <arg name="est_refine_iter" default="5"/>
   <!-- 初始對齊時的優化迭代次數 -->
   <arg name="track_refine_iter" default="2"/>
   <!-- 連續追蹤時的迭代次數 -->
+
+  <!-- ===================== Coarse Initial Pose Sampling ===================== -->
+  <arg name="coarse_min_n_views"              default="40"/> <!-- icosphere 最少視角數；40 通常會產生 42 個視角 -->
+  <arg name="coarse_inplane_step"             default="60"/> <!-- 平面內旋轉間隔；60=6 rotations，30=12 rotations -->
+  <arg name="coarse_orientation_mode"         default="inverted"/> <!-- uniform / upright / inverted -->
+  <arg name="coarse_orientation_tilt_deg"     default="80.0"/> <!-- 正放/倒放允許傾斜角度，單位 deg -->
+  <arg name="coarse_object_up_axis"           default="1"/> <!-- 0=X, 1=Y, 2=Z；目前定義綠色 Y 軸為判斷軸 -->
+
   <arg name="roi_expand" default="0.01"/>
-  <arg name="iou_stride" default="3"/>
-  <!-- IoU低於並且連續發生時，系統會重置並利用YOLO重新對齊 -->
-  <arg name="iou_log" default="false"/>
-  <arg name="iou_thresh" default="0.2"/>
-  <arg name="iou_patience" default="3"/>
-  <arg name="seg_warmup_n" default="8"/>
-  <!-- 剛鎖定目標的前N幀，會計算遮蔽率，N幀過後會降級為只計算2DIoU -->
-  <arg name="policy_occ_thresh_high" default="0.15"/>
-  <!-- 當果串被樹葉遮擋的比例大於此值 (如 0.90 即 90%)。 -->
+  <!-- FoundationPose 深度幾何自我評估：MAE 越低越好，Inlier Ratio 越高越好。 -->
+  <arg name="geom_mae_thresh" default="0.10"/>
+  <!-- MAE > 此值，視為重新初始化候選，單位 m。 -->
+  <arg name="geom_inlier_thresh" default="0.50"/>
+  <!-- Inlier Ratio < 此值，視為重新初始化候選。 -->
+  <arg name="occ_mae_thresh" default="0.05"/>
+  <!-- MAE <= 此值且 Inlier Ratio >= occ_inlier_thresh，視為低遮蔽。 -->
+  <arg name="occ_inlier_thresh" default="0.8"/>
+  <!-- 介於重新初始化門檻與低遮蔽門檻之間，視為高遮蔽。 -->
+  <arg name="geom_patience" default="5"/>
+  <!-- 連續 N 幀為重新初始化候選時，以目前 Cutie mask 重新註冊 FoundationPose，並同時判為高遮蔽。 -->
   <arg name="policy_high_patience" default="3"/>
-  <!-- 需連續高遮蔽N幀，切換為STEM模式。 -->
+  <!-- 連續高遮蔽 N 幀後切換至 STEM 模式。 -->
+
   <arg name="cls_bunch" default="0"/>
   <arg name="cls_stem" default="1"/>
 
@@ -66,18 +80,6 @@
   <arg name="max_depth_mm" default="2000.0"/>
   <arg name="colormap" default="2"/>
   <arg name="invert_colormap" default="false"/>
-
-  <arg name="pp_enable" default="true"/>
-  <arg name="pp_orient_center_tol_px" default="20.0"/>
-  <arg name="pp_bunch_expect_orientation" default="inverted"/>
-  <!-- 預期果串的朝向 inverted / upright -->
-  <arg name="pp_bunch_size_mode" default="bbox_mm"/>
-  <!-- depth / bbox_mm -->
-  <arg name="pp_bunch_expect_bbox_w_mm" default="115.0"/>
-  <arg name="pp_bunch_expect_bbox_h_mm" default="80.0"/>
-  <arg name="pp_bunch_size_ratio_min" default="0.6"/>
-  <arg name="pp_bunch_expect_depth_m" default="1.2"/>
-  <arg name="pp_bunch_depth_tol_m" default="0.25"/>
 
   <arg name="cmd_vel_topic" default="/cmd_vel"/>
   <!-- 預測葉莖在畫面中的新位置 -->
@@ -96,7 +98,6 @@
     <param name="image_topic" value="$(arg image_topic)"/>
     <param name="info_topic" value="$(arg info_topic)"/>
     <param name="depth_topic" value="$(arg depth_topic)"/>
-    <param name="depth_info_topic" value="$(arg depth_info_topic)"/>
     <param name="camera_tf" value="$(arg camera_tf)"/>
     <param name="bunch_name" value="$(arg bunch_name)"/>
     <param name="stem_name" value="$(arg stem_name)"/>
@@ -107,17 +108,27 @@
 
     <param name="yolo_start_mode" value="$(arg yolo_start_mode)"/>
     <param name="det_conf" value="$(arg det_conf)"/>
-    <param name="det_class" value="$(arg det_class)"/>
     <param name="det_imgsz" value="$(arg det_imgsz)"/>
     <param name="det_select_mode" value="$(arg det_select_mode)"/>
+    <param name="init_det_patience" value="$(arg init_det_patience)"/>
+
+    <param name="est_top_k" value="$(arg est_top_k)"/>
     <param name="est_refine_iter" value="$(arg est_refine_iter)"/>
     <param name="track_refine_iter" value="$(arg track_refine_iter)"/>
 
+    <param name="coarse/min_n_views" value="$(arg coarse_min_n_views)"/>
+    <param name="coarse/inplane_step" value="$(arg coarse_inplane_step)"/>
+    <param name="coarse/orientation_mode" value="$(arg coarse_orientation_mode)"/>
+    <param name="coarse/orientation_tilt_deg" value="$(arg coarse_orientation_tilt_deg)"/>
+    <param name="coarse/object_up_axis" value="$(arg coarse_object_up_axis)"/>
+
     <param name="roi_expand" value="$(arg roi_expand)"/>
-    <param name="iou_stride" value="$(arg iou_stride)"/>
-    <param name="iou_log" value="$(arg iou_log)"/>
-    <param name="iou_thresh" value="$(arg iou_thresh)"/>
-    <param name="iou_patience" value="$(arg iou_patience)"/>
+    <param name="self_eval_log" value="$(arg self_eval_log)"/>
+    <param name="geom_mae_thresh" value="$(arg geom_mae_thresh)"/>
+    <param name="geom_inlier_thresh" value="$(arg geom_inlier_thresh)"/>
+    <param name="occ_mae_thresh" value="$(arg occ_mae_thresh)"/>
+    <param name="occ_inlier_thresh" value="$(arg occ_inlier_thresh)"/>
+    <param name="geom_patience" value="$(arg geom_patience)"/>
 
     <param name="show_depth_window" value="$(arg show_depth_window)"/>
     <param name="show_rgb_window" value="$(arg show_rgb_window)"/>
@@ -129,17 +140,7 @@
     <param name="colormap" value="$(arg colormap)"/>
     <param name="invert_colormap" value="$(arg invert_colormap)"/>
 
-    <param name="postproc/enable" value="$(arg pp_enable)"/>
-    <param name="postproc/orient_center_tol_px" value="$(arg pp_orient_center_tol_px)"/>
-
     <param name="postproc/bunch/pipeline_mode" value ="$(arg bunch_pipeline_mode)"/>
-    <param name="postproc/bunch/expect_orientation" value ="$(arg pp_bunch_expect_orientation)"/>
-    <param name="postproc/bunch/size_mode" value ="$(arg pp_bunch_size_mode)"/>
-    <param name="postproc/bunch/expect_bbox_w_mm" value ="$(arg pp_bunch_expect_bbox_w_mm)"/>
-    <param name="postproc/bunch/expect_bbox_h_mm" value ="$(arg pp_bunch_expect_bbox_h_mm)"/>
-    <param name="postproc/bunch/size_ratio_min" value ="$(arg pp_bunch_size_ratio_min)"/>
-    <param name="postproc/bunch/expect_depth_m" value ="$(arg pp_bunch_expect_depth_m)"/>
-    <param name="postproc/bunch/depth_tolerance_m" value ="$(arg pp_bunch_depth_tol_m)"/>
 
     <param name="postproc/stem/pipeline_mode" value ="$(arg stem_pipeline_mode)"/>
     <param name="postproc/stem/cmd_vel_topic" value="$(arg cmd_vel_topic)" />
@@ -152,7 +153,6 @@
 
     <param name="classes/bunch" value ="$(arg cls_bunch)"/>
     <param name="classes/stem" value ="$(arg cls_stem)"/>
-    <param name="policy/occ_thresh_high" value ="$(arg policy_occ_thresh_high)"/>
     <param name="policy/high_patience" value ="$(arg policy_high_patience)"/>
 
     <param name="postproc/seg_model" value ="$(arg seg_model)"/>
@@ -160,6 +160,5 @@
     <param name="postproc/sam2_ckpt" value ="$(arg sam2_ckpt)"/>
     <param name="postproc/fastsam_ckpt" value ="$(arg fastsam_ckpt)"/>
     <param name="postproc/seg_imgsz" value ="$(arg det_imgsz)"/>
-    <param name="occ/seg_warmup_n" value="$(arg seg_warmup_n)"/>
   </node>
 </launch>
