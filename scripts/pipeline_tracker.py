@@ -9,6 +9,7 @@ import cv2
 import trimesh
 import torch
 import psutil
+import math
 
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import Pose, Transform, Point, Quaternion, Twist
@@ -108,6 +109,8 @@ class FoundationPosePipelineTracker:
         self.last_bunch_3d_pos = None
         self._pause_hold = False
         self._last_allowed = False
+        self.target_mode_locked = False
+        self.locked_target_mode = None
 
         # ------------------------------------------
         # Cutie VOS 初始化
@@ -287,6 +290,7 @@ class FoundationPosePipelineTracker:
             )
             self.det_select_mode = "score"
         self.init_det_patience = max(1, int(gp("init_det_patience", 10)))
+        self.middle_depth_tie_px = float(gp("selection/middle_depth_tie_px", 40.0))
 
         # FoundationPose 初始化／追蹤參數
         self.est_top_k = max(1, int(gp("est_top_k", 5)))
@@ -658,6 +662,23 @@ class FoundationPosePipelineTracker:
         if vals.size < min_valid: return None
         return float(np.min(vals)) if use == "min" else float(np.median(vals))
 
+    def _select_nearest_depth_from_indices(self,xyxy,scores,candidate_indices):
+        best_i = None
+        best_depth = float("inf")
+
+        for i in candidate_indices:
+            depth = self._bbox_depth_median(xyxy[i])
+
+            if depth is not None and depth < best_depth:
+                best_depth = depth
+                best_i = int(i)
+
+        if best_i is not None:
+            return best_i
+
+        # 全部沒有有效深度時用 confidence。
+        return int(max(candidate_indices,key=lambda i: float(scores[i])))
+
     def select_yolo_bbox(self, xyxy, scores, classes, img_shape, prefer_cls=None, select_mode="score", conf_th=0.0):
         """根據策略 (最高分、最置中、深度最近) 挑選最佳的 YOLO 偵測框"""
         if xyxy is None or len(xyxy) == 0: return None, None
@@ -680,14 +701,40 @@ class FoundationPosePipelineTracker:
             j = int(np.argmax(scores_f))
             return xyxy_f[j], float(scores_f[j])
         elif select_mode == "middle":
-            cx_img, cy_img = W * 0.5, H * 0.5
-            best_d, best_j = 1e18, -1
+            cx_img = W * 0.5
+            cy_img = H * 0.5
+            contains_center = []
+            center_distances = []
+
             for i, bb in enumerate(xyxy_f):
-                cx, cy = 0.5 * (bb[0] + bb[2]), 0.5 * (bb[1] + bb[3])
-                d = (cx - cx_img) ** 2 + (cy - cy_img) ** 2
-                if d < best_d:
-                    best_d, best_j = d, i
-            return (xyxy_f[best_j], float(scores_f[best_j])) if best_j >= 0 else (None, None)
+                x1, y1, x2, y2 = map(float, bb)
+
+                cx = 0.5 * (x1 + x2)
+                cy = 0.5 * (y1 + y2)
+
+                d = math.hypot(cx - cx_img,cy - cy_img)
+                center_distances.append(d)
+
+                if (x1 <= cx_img <= x2 and y1 <= cy_img <= y2):
+                    contains_center.append(i)
+
+            # 第一順位：包含畫面中心的 bbox。
+            if contains_center:
+                best_j = self._select_nearest_depth_from_indices(xyxy_f,scores_f,contains_center)
+
+                return xyxy_f[best_j], float(scores_f[best_j])
+
+            # 沒有 bbox 包含中心：
+            # 找最靠近中心的一組候選。
+            min_dist = min(center_distances)
+
+            tie_px = float(getattr(self, "middle_depth_tie_px", 40.0))
+
+            middle_candidates = [i for i, d in enumerate(center_distances)if d <= min_dist + tie_px]
+
+            best_j = self._select_nearest_depth_from_indices(xyxy_f,scores_f,middle_candidates)
+
+            return xyxy_f[best_j], float(scores_f[best_j])
         elif select_mode == "nearest_depth":
             depth_m = getattr(self, "depth_m", None)
             if depth_m is None:
@@ -1427,9 +1474,42 @@ class FoundationPosePipelineTracker:
         if mode not in ("score", "middle", "nearest_depth"):
             rospy.logwarn_throttle(1.0, f"[DETECTION] invalid det_select_mode={mode}, fallback score")
             mode = "score"
+
+        allowed = bool(getattr(msg, "detection_allowed", False))
+
+        previous_select_mode = self.det_select_mode_current
         self.det_select_mode_current = mode
-        self.ready_received.detection_allowed = bool(getattr(msg, "detection_allowed", False))
-    
+        self.ready_received.detection_allowed = allowed
+
+        # middle：車體對位完成，鎖定當下 bunch / stem
+        if allowed and mode == "middle":
+            if not self.target_mode_locked:
+                locked_mode = (self.mode if self.mode in ("bunch", "stem")else "bunch")
+
+                self.target_mode_locked = True
+                self.locked_target_mode = locked_mode
+                self.mode = locked_mode
+
+                # middle 後不再累積遮蔽率切換計數。
+                self._hi_cnt = 0
+                rospy.logwarn(
+                    f"[TARGET MODE LOCK] middle received -> "
+                    f"lock mode={self.locked_target_mode}"
+                )
+            else:
+                self.mode = self.locked_target_mode
+
+        # nearest_depth / score：回到找目標階段，解除鎖定
+        elif allowed and mode in ("nearest_depth", "score"):
+            if self.target_mode_locked:
+                rospy.logwarn(
+                    f"[TARGET MODE UNLOCK] "
+                    f"{previous_select_mode} -> {mode}"
+                )
+
+            self.target_mode_locked = False
+            self.locked_target_mode = None
+
     def harvestDoneCallback(self, msg: Bool):
         if not bool(msg.data):
             return
@@ -1516,6 +1596,8 @@ class FoundationPosePipelineTracker:
         self.pose_bunch = None
         self.pose_stem  = None
         self._hi_cnt = 0
+        self.target_mode_locked = False
+        self.locked_target_mode = None
         self._stem_lock = False
         self.target_stem_id = -1
 
@@ -1935,21 +2017,26 @@ class FoundationPosePipelineTracker:
                         )
                 else:
                     # 中間品質區間視為高遮蔽；低 MAE 且高 Inlier Ratio 視為低遮蔽。
-                    if high_occlusion:
-                        self._hi_cnt += 1
-                    else:
+                    # middle 後不再用遮蔽率切換 bunch / stem。
+                    if self.target_mode_locked:
                         self._hi_cnt = 0
-                    self.geom_high_occlusion = bool(high_occlusion)
+                        if self.locked_target_mode in ("bunch", "stem"):
+                            self.mode = self.locked_target_mode
+                        rospy.loginfo_throttle(1.0,f"[OCCLUSION POLICY DISABLED] target mode locked={self.locked_target_mode}")
 
-                    if self._hi_cnt >= self.policy_hi_pat:
-                        self.mode = "stem"
-                        self.stem_cutie_state = "CRUISING"
-                        # Stem mode 1~3 將開始使用 Cutie，切換前清空其舊記憶。
-                        self._reset_cutie_processor(reason="mode switch bunch -> stem")
-                        rospy.logwarn(
-                            "[MODE SWITCH] MAE / Inlier Ratio 判定為高遮蔽，"
-                            "切換至 STEM 模式。"
-                        )
+                    else:
+                        if high_occlusion:
+                            self._hi_cnt += 1
+                        else:
+                            self._hi_cnt = 0
+
+                        if self._hi_cnt >= self.policy_hi_pat:
+                            self.mode = "stem"
+                            self.stem_cutie_state = "CRUISING"
+
+                            self._reset_cutie_processor(reason="mode switch bunch -> stem")
+
+                            rospy.logwarn("[MODE SWITCH] MAE / Inlier Ratio 判定為高遮蔽，切換至 STEM 模式。")
 
                     if self.pose_bunch is not None:
                         self.last_bunch_3d_pos = self.pose_bunch[:3, 3].copy()
