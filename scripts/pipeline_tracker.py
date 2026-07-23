@@ -44,7 +44,7 @@ try:
     CUTIE_AVAILABLE = True
 except ImportError:
     CUTIE_AVAILABLE = False
-    print("[WARNING] Cutie module not found. Stem Servoing will fallback or fail.")
+    print("[WARNING] Cutie module not found. Frond Servoing will fallback or fail.")
 
 os.environ.setdefault("ULTRALYTICS_NO_INSTALL", "1")
 
@@ -82,7 +82,7 @@ class FoundationPosePipelineTracker:
         self.depth_size = (0, 0)
         self.rgb_size = (0, 0)
         
-        # 紀錄果串(bunch)與葉莖(stem)的 6D 姿態矩陣
+        # 紀錄果串(fruit)與葉莖(frond)的 6D 姿態矩陣
         self.pose_bunch = None
         self.pose_stem  = None
         self.mask = None
@@ -122,12 +122,12 @@ class FoundationPosePipelineTracker:
             self.cutie_processor = InferenceCore(self.cutie_net, cfg=self.cutie_net.cfg)
             self.cutie_processor.max_internal_size = 640 # 限制解析度以防止記憶體溢出 (OOM)
 
-        # Stem 維持原本的 Cutie / SAM2 追蹤狀態。
-        # Bunch 不再使用 Cutie；是否已進入 FoundationPose tracking 直接由 pose_bunch 判斷。
+        # Frond 維持原本的 Cutie / SAM2 追蹤狀態。
+        # Fruit 不再使用 Cutie；是否已進入 FoundationPose tracking 直接由 pose_bunch 判斷。
         self.stem_cutie_state = "CRUISING"
         
         # ------------------------------------------
-        # 葉莖 (Stem) 持續追蹤狀態 (用於運動預測)
+        # 葉莖 (Frond) 持續追蹤狀態 (用於運動預測)
         # ------------------------------------------
         self.last_stem_3d_pos = None  # 紀錄最後一次算出的葉莖 3D 相機座標
         self.last_stem_time = None    # 紀錄最後一次更新的時間，計算 dt 用
@@ -162,9 +162,7 @@ class FoundationPosePipelineTracker:
         self.harvest_done_sub = rospy.Subscriber("FFB_state" + "_harvest_done", Bool, self.harvestDoneCallback, queue_size=1)
         if self.yolo_start_mode == "wait":
             self._ready_sub = rospy.Subscriber("FFB_state" + "_detection", Detection, self.detectionCallback, queue_size=1)
-
         self.window_create()
-
         # ------------------------------------------
         # FoundationPose 模型初始化
         # ------------------------------------------
@@ -176,7 +174,6 @@ class FoundationPosePipelineTracker:
         self.scorer = ScorePredictor()
         self.refiner = PoseRefinePredictor()
         self.glctx = dr.RasterizeCudaContext()
-
         self.est_bunch = FoundationPose(
             model_pts=self.mesh_bunch.vertices,
             model_normals=self.mesh_bunch.vertex_normals,
@@ -244,7 +241,7 @@ class FoundationPosePipelineTracker:
         if 2 in [self.bunch_pipeline_mode, self.stem_pipeline_mode]: load_sam_family(2, self.sam2_ckpt)
         if 3 in [self.bunch_pipeline_mode, self.stem_pipeline_mode]: load_sam_family(3, self.fastsam_ckpt)
 
-        # 針對 Stem 模式 4：不使用 Cutie，純依賴 SAM2 Dynamic Interactive Predictor 進行影像追蹤
+        # 針對 Frond 模式 4：不使用 Cutie，純依賴 SAM2 Dynamic Interactive Predictor 進行影像追蹤
         self.sam2_tracker = None
         if self.stem_pipeline_mode == 4:
             rospy.loginfo(f"載入 SAM2 Dynamic Interactive Predictor: {self.sam2_ckpt}")
@@ -255,7 +252,7 @@ class FoundationPosePipelineTracker:
                 rospy.logwarn(f"[SAM2_TRACKER] init failed: {e}")
 
         # 總控狀態機模式
-        self.mode = "bunch"     # 初始尋找果串 (bunch)，後續依遮蔽率切換為葉莖 (stem)
+        self.mode = "fruit"     # 初始尋找果串 (fruit)，後續依遮蔽率切換為葉莖 (frond)
         self._hi_cnt = 0
         self._registering_until = 0
         self._reinit_until = 0
@@ -272,7 +269,7 @@ class FoundationPosePipelineTracker:
         self.depth_topic = gp("depth_topic", "/camera/aligned_depth_to_color/image_raw")
         self.camera_tf = gp("camera_tf", "")
         self.bunch_name = gp("bunch_name", "oilpalm")
-        self.stem_name = gp("stem_name", "stem")
+        self.stem_name = gp("stem_name", "frond")
 
         self.mesh_file = gp("mesh_file", "")
         self.det_model = gp("det_model", "yolov11n.onnx")
@@ -384,25 +381,25 @@ class FoundationPosePipelineTracker:
         # [核心設定] 果串 (BUNCH) 追蹤管線設定
         # 1: YOLO+SAM, 2: YOLO+SAM2, 3: YOLO+FastSAM, 4: YOLO-seg
         # ------------------------------------------
-        self.bunch_pipeline_mode = int(gp("postproc/bunch/pipeline_mode", 4)) 
+        self.bunch_pipeline_mode = int(gp("postproc/fruit/pipeline_mode", 4)) 
 
         # ------------------------------------------
         # [核心設定] 葉莖 (STEM) 追蹤管線設定
         # 1: YOLO+SAM+Cutie, 2: YOLO+SAM2+Cutie, 3: YOLO+FastSAM+Cutie, 4: YOLO+SAM2純追蹤(無Cutie)
         # ------------------------------------------
-        self.stem_pipeline_mode = int(gp("postproc/stem/pipeline_mode", 1)) 
-        self.cmd_vel_topic = gp("postproc/stem/cmd_vel_topic", "/cmd_vel")
-        self.stem_lost = float(gp("postproc/stem/stem_lost", 3.0))
-        self.stem_depth_min = float(gp("postproc/stem/stem_depth_min", 0.1))
-        self.stem_depth_max = float(gp("postproc/stem/stem_depth_max", 3.0))
-        self.stem_assumed_radius = float(gp("postproc/stem/stem_assumed_radius", 0.02))
+        self.stem_pipeline_mode = int(gp("postproc/frond/pipeline_mode", 1)) 
+        self.cmd_vel_topic = gp("postproc/frond/cmd_vel_topic", "/cmd_vel")
+        self.stem_lost = float(gp("postproc/frond/stem_lost", 3.0))
+        self.stem_depth_min = float(gp("postproc/frond/stem_depth_min", 0.1))
+        self.stem_depth_max = float(gp("postproc/frond/stem_depth_max", 3.0))
+        self.stem_assumed_radius = float(gp("postproc/frond/stem_assumed_radius", 0.02))
         # YOLO tracker 已停用；YOLO 只使用 predict() 做純偵測，不使用 ByteTrack / BoT-SORT。
-        self.stem_max_jump_m = float(gp("postproc/stem/max_jump_m", 0.06)) 
-        self.stem_ema_alpha = float(gp("postproc/stem/ema_alpha", 0.6))
+        self.stem_max_jump_m = float(gp("postproc/frond/max_jump_m", 0.06)) 
+        self.stem_ema_alpha = float(gp("postproc/frond/ema_alpha", 0.6))
 
 
-        self.cls_bunch = int(gp("classes/bunch", 0))
-        self.cls_stem = int(gp("classes/stem",  1))
+        self.cls_bunch = int(gp("classes/fruit", 0))
+        self.cls_stem = int(gp("classes/frond",  1))
 
         # 高遮蔽狀態連續出現 N 幀後切換至葉莖模式。
         self.policy_hi_pat = max(1, int(gp("policy/high_patience", 3)))
@@ -469,8 +466,8 @@ class FoundationPosePipelineTracker:
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"detector model not found: {model_path}")
         def _onnx_sibling(p):
-            stem, ext = os.path.splitext(p)
-            return stem + ".onnx"
+            frond, ext = os.path.splitext(p)
+            return frond + ".onnx"
         ext = os.path.splitext(model_path)[1].lower()
         det_device = "cpu"
         if ext == ".pt":
@@ -566,7 +563,7 @@ class FoundationPosePipelineTracker:
         - 不使用 detector.track()。
         - 不使用 ByteTrack / BoT-SORT / 任何 YOLO tracker。
         - YOLO 只負責 CRUISING 階段的重新偵測與初始化。
-        - Bunch 後續追蹤交給 FoundationPose.track_one()；Stem mode 1~3 交給 Cutie，mode 4 交給 SAM2 tracker。
+        - Fruit 後續追蹤交給 FoundationPose.track_one()；Stem mode 1~3 交給 Cutie，mode 4 交給 SAM2 tracker。
         - ids 全部填 -1，避免後續邏輯依賴 YOLO tracker ID。
         """
         empty = (
@@ -743,9 +740,9 @@ class FoundationPosePipelineTracker:
             best_dist, best_j = 1e18, -1
             z_max = float(self.max_depth_mm) * 0.001 if hasattr(self, "max_depth_mm") else 10.0
             for i, bb in enumerate(xyxy_f):
-                dist = self._bbox_depth_distance_m(bb, depth_m, z_max=z_max)
-                if dist is not None and dist < best_dist:
-                    best_dist, best_j = dist, i
+                distance = self._bbox_depth_distance_m(bb, depth_m, z_max=z_max)
+                if distance is not None and distance < best_dist:
+                    best_dist, best_j = distance, i
             if best_j >= 0:
                 return xyxy_f[best_j], float(scores_f[best_j])
             j = int(np.argmax(scores_f))
@@ -998,7 +995,7 @@ class FoundationPosePipelineTracker:
         return "HIGH_OCCLUSION", False, True, score
 
     def _draw_pose_box(self, img_bgr, K, pose_obj_in_cam, bbox_minmax, which, axis_scale=0.05):
-        if which.lower() != "bunch": return img_bgr
+        if which.lower() != "fruit": return img_bgr
         try:
             to_origin = self.to_origin_bunch
             center_pose = pose_obj_in_cam @ np.linalg.inv(to_origin)
@@ -1046,7 +1043,7 @@ class FoundationPosePipelineTracker:
             return self.rect_to_mask(bgr, xyxy, expand=self.roi_expand)
 
     # =========================
-    # 葉莖 (Stem) 實體追蹤與深度計算
+    # 葉莖 (Frond) 實體追蹤與深度計算
     # =========================
     def _backproject_uvz(self, u, v, z):
         """將 pixel + depth 反投影到 camera_color_optical_frame。"""
@@ -1065,17 +1062,17 @@ class FoundationPosePipelineTracker:
 
     def calculate_direct_root_pose(self, depth_m, mask_bool):
         """
-        從 stem mask + depth 建立與 FoundationPose 相同定義的 4x4 pose。
+        從 frond mask + depth 建立與 FoundationPose 相同定義的 4x4 pose。
 
-        統一定義：回傳的 pose 是 T_camera_stem，也就是 stem 物件座標系在
+        統一定義：回傳的 pose 是 T_camera_stem，也就是 frond 物件座標系在
         camera_color_optical_frame 下的位置與姿態。矩陣欄向量定義如下：
             T[:3, 0] = +X_stem，顯示為紅色
             T[:3, 1] = +Y_stem，顯示為綠色
             T[:3, 2] = +Z_stem，顯示為藍色
 
-        純分割沒有 CAD mesh，因此這裡用穩定的幾何規則定義 stem frame：
+        純分割沒有 CAD mesh，因此這裡用穩定的幾何規則定義 frond frame：
             origin  = mask 最下方的 root / cut point
-            +Y      = root 指向 stem 上方的中心線方向
+            +Y      = root 指向 frond 上方的中心線方向
             +Z      = camera ray 在垂直於 +Y 的平面上投影後的方向
             +X      = +Y 與 +Z 決定的右手座標軸
         """
@@ -1106,7 +1103,7 @@ class FoundationPosePipelineTracker:
         center_3d[2] += float(self.stem_assumed_radius)
         projected_2d = (target_u, target_v)
 
-        # 2) +Y_stem：root 指向 stem 上方中心線。
+        # 2) +Y_stem：root 指向 frond 上方中心線。
         #    取 mask 較上方的一小群點，比單點 PCA 更穩。
         top_k = min(30, len(sorted_indices))
         top_indices = sorted_indices[-top_k:]
@@ -1116,7 +1113,7 @@ class FoundationPosePipelineTracker:
         p_top = self._backproject_uvz(top_u, top_v, top_z)
         y_axis = self._normalize_vec(p_top - p_surface, fallback=np.array([0.0, -1.0, 0.0]))
 
-        # 3) +Z_stem：用相機視線方向固定 stem 的 roll，避免每幀亂轉。
+        # 3) +Z_stem：用相機視線方向固定 frond 的 roll，避免每幀亂轉。
         #    先把 camera ray 投影到垂直於 +Y 的平面，確保與 +Y 正交。
         cam_ray = self._normalize_vec(center_3d, fallback=np.array([0.0, 0.0, 1.0]))
         z_axis = cam_ray - np.dot(cam_ray, y_axis) * y_axis
@@ -1272,7 +1269,7 @@ class FoundationPosePipelineTracker:
         STEM 抓取候選選擇策略。
         優先順序：
         1. 距離相機最近的 stem。
-        2. 若 stem 深度不可用，選離最近距離 bunch 最近的 stem。
+        2. 若 frond 深度不可用，選離最近距離 fruit 最近的 stem。
         3. 若沒有有效 bunch，退回最高分 stem。
         """
         if xyxy_all is None or len(xyxy_all) == 0:
@@ -1286,11 +1283,11 @@ class FoundationPosePipelineTracker:
         if stem_xyxy is not None:
             rospy.loginfo_throttle(
                 0.5,
-                f"[STEM SELECT] nearest-depth stem selected: depth={stem_depth:.3f}m, score={stem_score:.3f}"
+                f"[STEM SELECT] nearest-depth frond selected: depth={stem_depth:.3f}m, score={stem_score:.3f}"
             )
             return stem_xyxy, stem_score
 
-        # 第二順位：找最近距離 bunch，再選離該 bunch 中心最近的 stem。
+        # 第二順位：找最近距離 bunch，再選離該 fruit 中心最近的 stem。
         bunch_xyxy, bunch_score, bunch_depth = self.select_nearest_depth_bbox_for_cls(
             xyxy_all, sc_all, cl_all, self.cls_bunch, conf_th=self.det_conf
         )
@@ -1299,7 +1296,7 @@ class FoundationPosePipelineTracker:
         if stem_idx.size == 0:
             return None, None
 
-        # 如果沒有有效 bunch depth，改用最高分 bunch 作為幾何參考。
+        # 如果沒有有效 fruit depth，改用最高分 fruit 作為幾何參考。
         if bunch_xyxy is None:
             bunch_xyxy, bunch_score = self.select_yolo_bbox(
                 xyxy_all, sc_all, cl_all,
@@ -1330,7 +1327,7 @@ class FoundationPosePipelineTracker:
             if best_i >= 0:
                 rospy.loginfo_throttle(
                     0.5,
-                    f"[STEM SELECT] fallback nearest-to-nearest-bunch selected: "
+                    f"[STEM SELECT] fallback nearest-to-nearest-fruit selected: "
                     f"stem_score={float(sc_all[best_i]):.3f}, "
                     f"bunch_depth={bunch_depth if bunch_depth is not None else -1:.3f}m"
                 )
@@ -1348,7 +1345,7 @@ class FoundationPosePipelineTracker:
         if stem_xyxy is not None:
             rospy.loginfo_throttle(
                 0.5,
-                f"[STEM SELECT] fallback highest-score stem selected: score={stem_score:.3f}"
+                f"[STEM SELECT] fallback highest-score frond selected: score={stem_score:.3f}"
             )
 
         return stem_xyxy, stem_score
@@ -1360,7 +1357,9 @@ class FoundationPosePipelineTracker:
         w, h = init_size
         try: cv2.destroyWindow(name)
         except Exception: pass
+        # print(f"準備建立視窗: {name}")
         cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+        # print(f"視窗建立成功: {name}")
         cv2.resizeWindow(name, int(w), int(h))
         cv2.moveWindow(name, int(pos_xy[0]), int(pos_xy[1]))
         if is_rgb:
@@ -1428,7 +1427,7 @@ class FoundationPosePipelineTracker:
         return t, (float(qx),float(qy),float(qz),float(qw))
 
     def broadcast_transform_and_pose(self, T: np.ndarray, which: str, parent: str):
-        child = self.bunch_name if which.lower() == "bunch" else self.stem_name
+        child = self.bunch_name if which.lower() == "fruit" else self.stem_name
         t = (float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
         qx, qy, qz, qw = tf.transformations.quaternion_from_matrix(T)
         self.tf_broadcaster.sendTransform(t, (qx, qy, qz, qw), rospy.Time.now(), child, parent)
@@ -1481,10 +1480,10 @@ class FoundationPosePipelineTracker:
         self.det_select_mode_current = mode
         self.ready_received.detection_allowed = allowed
 
-        # middle：車體對位完成，鎖定當下 bunch / stem
+        # middle：車體對位完成，鎖定當下 fruit / frond
         if allowed and mode == "middle":
             if not self.target_mode_locked:
-                locked_mode = (self.mode if self.mode in ("bunch", "stem")else "bunch")
+                locked_mode = (self.mode if self.mode in ("fruit", "frond")else "fruit")
 
                 self.target_mode_locked = True
                 self.locked_target_mode = locked_mode
@@ -1513,12 +1512,12 @@ class FoundationPosePipelineTracker:
     def harvestDoneCallback(self, msg: Bool):
         if not bool(msg.data):
             return
-        rospy.logwarn("[HARVEST_DONE] received True -> hard reset to bunch")
+        rospy.logwarn("[HARVEST_DONE] received True -> hard reset to fruit")
         self._reset_all_to_bunch()
         self._publish_zero_current(used_seg=False)
 
     def _tag(self, which: str) -> str:
-        return "bunch" if which.lower() == "bunch" else "stem"
+        return "fruit" if which.lower() == "fruit" else "frond"
 
     def _state(self, which: str, used_seg: bool = False) -> str:
         part = self._tag(which)
@@ -1530,7 +1529,7 @@ class FoundationPosePipelineTracker:
         if not (self.got_depth and self.got_rgb and self.K is not None and hasattr(self, "depth_m")):
             return f"{part}:INITIALIZING"
 
-        if which.lower() == "bunch":
+        if which.lower() == "fruit":
             if self.pose_bunch is None:
                 return f"{part}:YOLO"
             return f"{part}:STABLE"
@@ -1543,12 +1542,12 @@ class FoundationPosePipelineTracker:
         conf_msg = Confidence()
         conf_msg.stamp = rospy.Time.now()
         conf_msg.state = self._state(which, used_seg=used_seg)
-        conf_msg.frame_id = self.bunch_name if which.lower() == "bunch" else self.stem_name
+        conf_msg.frame_id = self.bunch_name if which.lower() == "fruit" else self.stem_name
         # forklift_msg/Confidence 欄位名稱仍為 object_IoU；此處改放深度幾何自我評估分數。
         conf_msg.object_IoU = float(confidence_score)
         conf_msg.object_detection = bool(detection)
 
-        T = self.pose_bunch if which.lower() == "bunch" else self.pose_stem
+        T = self.pose_bunch if which.lower() == "fruit" else self.pose_stem
         if T is not None:
             t = (float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
             qx, qy, qz, qw = tf.transformations.quaternion_from_matrix(T)
@@ -1561,7 +1560,7 @@ class FoundationPosePipelineTracker:
         self.conf_pub.publish(conf_msg)
 
     def _publish_zero_current(self, used_seg: bool = False):
-        which = "stem" if self.mode == "stem" else "bunch"
+        which = "frond" if self.mode == "frond" else "fruit"
         self.confidence_publish(which, 0.0, False, used_seg=used_seg)
 
     def _reset_cutie_processor(self, reason=""):
@@ -1592,7 +1591,7 @@ class FoundationPosePipelineTracker:
             self.cutie_processor = None
 
     def _reset_pipeline_state(self):
-        self.mode = "bunch"
+        self.mode = "fruit"
         self.pose_bunch = None
         self.pose_stem  = None
         self._hi_cnt = 0
@@ -1614,7 +1613,7 @@ class FoundationPosePipelineTracker:
         self.last_bunch_3d_pos = None
 
         self.stem_cutie_state = "CRUISING"
-        # Cutie 僅服務 Stem；整體重置時仍需清除 Stem 的時序記憶。
+        # Cutie 僅服務 Stem；整體重置時仍需清除 Frond 的時序記憶。
         self._reset_cutie_processor(reason="_reset_pipeline_state")
 
         if getattr(self, "sam2_tracker", None) is not None:
@@ -1635,12 +1634,12 @@ class FoundationPosePipelineTracker:
         """
         STEM tracking loss 時使用。
         重點：
-        - 不切回 bunch，仍停留在 self.mode == "stem"。
-        - 清掉目前 stem pose / tracking memory。
+        - 不切回 bunch，仍停留在 self.mode == "frond"。
+        - 清掉目前 frond pose / tracking memory。
         - 下一幀回到 STEM CRUISING，重新執行 YOLO + SAM/SAM2/FastSAM，
           重新給 Cutie 第一幀 mask。
         """
-        rospy.logwarn(f"[STEM RESET] reset stem to CRUISING. reason={reason}")
+        rospy.logwarn(f"[STEM RESET] reset frond to CRUISING. reason={reason}")
 
         self.pose_stem = None
         self._stem_lock = False
@@ -1649,12 +1648,12 @@ class FoundationPosePipelineTracker:
         self.last_stem_time = None
         self.stem_cutie_state = "CRUISING"
 
-        self.confidence_publish("stem", 0.0, False, used_seg=False)
+        self.confidence_publish("frond", 0.0, False, used_seg=False)
 
         # Mode 1~3：Cutie tracking loss，重建 InferenceCore，避免 memory / sensory state 殘留。
         if self.stem_pipeline_mode != 4:
             try:
-                self._reset_cutie_processor(reason=f"stem lost: {reason}")
+                self._reset_cutie_processor(reason=f"frond lost: {reason}")
             except Exception as e:
                 rospy.logwarn(f"[STEM RESET] Cutie reset failed: {e}")
                 try:
@@ -1714,7 +1713,7 @@ class FoundationPosePipelineTracker:
         YOLO 必須連續偵測到果串 N 幀才允許 FoundationPose.register()；
         任一幀未偵測到目標即將 consecutive_det_count 歸零。
         """
-        if which != "bunch":
+        if which != "fruit":
             return (xyxy_now is not None), xyxy_now, 0
 
         if xyxy_now is None:
@@ -1756,15 +1755,15 @@ class FoundationPosePipelineTracker:
             self.frame_count += 1
             now = rospy.Time.now()
             
-            # Bunch 的 FoundationPose 追蹤不需要 Cutie，也不需要建立 Cutie 輸入 tensor。
-            # 只有 Stem mode 1~3 真正執行 Cutie 時，才在下方建立 img_tensor。
+            # Fruit 的 FoundationPose 追蹤不需要 Cutie，也不需要建立 Cutie 輸入 tensor。
+            # 只有 Frond mode 1~3 真正執行 Cutie 時，才在下方建立 img_tensor。
             vis_bgr = self.color.copy()
 
             # --- 判斷目前狀態是否需要運行 YOLO 來重新尋找物體 ---
             run_yolo = False
-            if self.mode == "bunch" and self.pose_bunch is None:
+            if self.mode == "fruit" and self.pose_bunch is None:
                 run_yolo = True
-            elif self.mode == "stem" and self.stem_cutie_state == "CRUISING":
+            elif self.mode == "frond" and self.stem_cutie_state == "CRUISING":
                 run_yolo = True
 
             xyxy_all, sc_all, cl_all, ids_all = None, None, None, None
@@ -1774,20 +1773,20 @@ class FoundationPosePipelineTracker:
                 # if self.show_rgb_win:
                 #     vis_bgr = self.draw_yolo_detections(vis_bgr, xyxy_all, sc_all, cl_all)
 
-            # Cutie 僅供 Stem mode 1~3 使用；標籤 2 代表葉莖。
+            # Cutie 僅供 Frond mode 1~3 使用；標籤 2 代表葉莖。
             cutie_init_mask = np.zeros((self.rgb_size[1], self.rgb_size[0]), dtype=np.uint8)
             cutie_init_objs = []
 
             # ==========================================
             # 1. BUNCH CRUISING (全域搜尋果串)
             # ==========================================
-            if self.mode == "bunch" and self.pose_bunch is None:
+            if self.mode == "fruit" and self.pose_bunch is None:
                 bunch_xyxy, bunch_conf = self.select_yolo_bbox(
                     xyxy_all, sc_all, cl_all, img_shape=self.color.shape,
                     prefer_cls=self.cls_bunch, select_mode=self.det_select_mode_current, conf_th=self.det_conf
                 )
                 do_register, bb_use, lock_count = self._yolo_delay_update(
-                    "bunch", bunch_xyxy
+                    "fruit", bunch_xyxy
                 )
 
                 if self.show_rgb_win:
@@ -1836,7 +1835,7 @@ class FoundationPosePipelineTracker:
             # 2. STEM CRUISING (根據機器人軌跡搜尋葉莖)
             # ==========================================
             predicted_2d = None
-            if self.mode == "stem":
+            if self.mode == "frond":
                 # 計算先前的物理預測落點
                 predicted_3d = self.get_predicted_stem_pos(now)
                 if predicted_3d is not None and predicted_3d[2] > 0:
@@ -1849,12 +1848,12 @@ class FoundationPosePipelineTracker:
                     # STEM 重新初始化不使用 YOLO tracker ID。
                     # 優先順序：
                     #   1) 距離相機最近的 stem。
-                    #   2) 若 stem 深度不可用，選離最近距離 bunch 最近的 stem。
+                    #   2) 若 frond 深度不可用，選離最近距離 fruit 最近的 stem。
                     #   3) 若都不可用，退回最高分 stem。
                     stem_xyxy, stem_score = self.select_stem_bbox_priority(xyxy_all, sc_all, cl_all)
 
                     if stem_xyxy is None and predicted_2d is not None:
-                        # 最後補救：若 YOLO 有 stem 但深度/果串參考都失敗，
+                        # 最後補救：若 YOLO 有 frond 但深度/果串參考都失敗，
                         # 用上一幀運動預測點找最接近的 stem。
                         stem_xyxy, stem_score, _ = self.pick_nearest_to_2d_point(xyxy_all, sc_all, cl_all, ids_all, predicted_2d, self.cls_stem)
 
@@ -1866,7 +1865,7 @@ class FoundationPosePipelineTracker:
                             self.last_stem_time = None
 
                     if stem_xyxy is not None:
-                        # [核心修改] 根據 Stem Mode (1~4) 進行分流處理
+                        # [核心修改] 根據 Frond Mode (1~4) 進行分流處理
                         # Mode 4: 捨棄 Cutie，完全交由 SAM2 內建的 Video Tracker 追蹤
                         if self.stem_pipeline_mode == 4 and getattr(self, "sam2_tracker", None) is not None:
                             x1, y1, x2, y2 = stem_xyxy.astype(int)
@@ -1897,11 +1896,11 @@ class FoundationPosePipelineTracker:
                                 cutie_init_objs.append(2)
 
             # ==========================================
-            # 3. 執行 Stem Cutie 推論（Bunch 完全不使用 Cutie）
+            # 3. 執行 Frond Cutie 推論（Bunch 完全不使用 Cutie）
             # ==========================================
             pred_mask_tensor = None
             stem_needs_cutie = (
-                self.mode == "stem"
+                self.mode == "frond"
                 and self.stem_pipeline_mode != 4
                 and (len(cutie_init_objs) > 0 or self.stem_cutie_state == "SERVOING")
             )
@@ -1909,7 +1908,7 @@ class FoundationPosePipelineTracker:
                 img_rgb = cv2.cvtColor(self.color, cv2.COLOR_BGR2RGB)
                 img_tensor = F.to_tensor(img_rgb).cuda().float()
 
-                # 情況 A：YOLO + segmentation 剛交接，將 Stem 第一幀 mask 寫入 Cutie。
+                # 情況 A：YOLO + segmentation 剛交接，將 Frond 第一幀 mask 寫入 Cutie。
                 if len(cutie_init_objs) > 0:
                     init_mask_tensor = torch.from_numpy(cutie_init_mask).cuda().long()
                     with torch.cuda.amp.autocast(), torch.inference_mode():
@@ -1929,7 +1928,7 @@ class FoundationPosePipelineTracker:
             #    register() 後直接 track_one(enable_self_check=True)，不使用 Cutie。
             # ==========================================
             self_eval_for_publish = 0.0
-            if self.mode == "bunch" and self.pose_bunch is not None:
+            if self.mode == "fruit" and self.pose_bunch is not None:
                 used_seg = False  # segmentation 只在 register / re-register 時使用
                 track_extra = {}
 
@@ -1979,6 +1978,7 @@ class FoundationPosePipelineTracker:
 
                 reinit_by_geometry = self.geom_bad_count >= self.geom_patience
                 if reinit_by_geometry:
+                    self._hi_cnt += 1
                     mae_text = (
                         "None" if self.depth_mae is None else f"{self.depth_mae:.4f}m"
                     )
@@ -2001,26 +2001,16 @@ class FoundationPosePipelineTracker:
                     self.geom_state = "REINIT_REQUIRED"
                     self.geom_high_occlusion = True
                     self.depth_conf_score = None
-                    self._hi_cnt = 0
-                    self.confidence_publish("bunch", 0.0, False, used_seg=False)
+                    self.confidence_publish("fruit", 0.0, False, used_seg=False)
 
                     if self.show_rgb_win:
-                        cv2.putText(
-                            vis_bgr,
-                            "BUNCH REINIT: waiting for YOLO + segmentation",
-                            (10, 100),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.65,
-                            (0, 0, 255),
-                            2,
-                            cv2.LINE_AA,
-                        )
+                        cv2.putText(vis_bgr,"BUNCH REINIT: waiting for YOLO + segmentation",(10, 100),cv2.FONT_HERSHEY_SIMPLEX,0.65,(0, 0, 255),2,cv2.LINE_AA)
                 else:
                     # 中間品質區間視為高遮蔽；低 MAE 且高 Inlier Ratio 視為低遮蔽。
-                    # middle 後不再用遮蔽率切換 bunch / stem。
+                    # middle 後不再用遮蔽率切換 fruit / stem。
                     if self.target_mode_locked:
                         self._hi_cnt = 0
-                        if self.locked_target_mode in ("bunch", "stem"):
+                        if self.locked_target_mode in ("fruit", "frond"):
                             self.mode = self.locked_target_mode
                         rospy.loginfo_throttle(1.0,f"[OCCLUSION POLICY DISABLED] target mode locked={self.locked_target_mode}")
 
@@ -2031,10 +2021,9 @@ class FoundationPosePipelineTracker:
                             self._hi_cnt = 0
 
                         if self._hi_cnt >= self.policy_hi_pat:
-                            self.mode = "stem"
+                            self.mode = "frond"
                             self.stem_cutie_state = "CRUISING"
-
-                            self._reset_cutie_processor(reason="mode switch bunch -> stem")
+                            self._reset_cutie_processor(reason="mode switch fruit -> frond")
 
                             rospy.logwarn("[MODE SWITCH] MAE / Inlier Ratio 判定為高遮蔽，切換至 STEM 模式。")
 
@@ -2046,10 +2035,10 @@ class FoundationPosePipelineTracker:
                             else "camera_color_optical_frame"
                         )
                         self.broadcast_transform_and_pose(
-                            self.pose_bunch, "bunch", parent_frame
+                            self.pose_bunch, "fruit", parent_frame
                         )
                         self.confidence_publish(
-                            "bunch", self_eval_for_publish, True, used_seg=False
+                            "fruit", self_eval_for_publish, True, used_seg=False
                         )
 
                         if self.show_rgb_win:
@@ -2102,7 +2091,7 @@ class FoundationPosePipelineTracker:
             # ==========================================
             # 5. STEM SERVOING (依據 2D Mask 計算葉莖 3D 切割點)
             # ==========================================
-            if self.mode == "stem" and self.stem_cutie_state == "SERVOING":
+            if self.mode == "frond" and self.stem_cutie_state == "SERVOING":
                 stem_mask_255 = None
                 
                 # Mode 4 分流: 提取 SAM2 Tracker 的結果
@@ -2136,14 +2125,14 @@ class FoundationPosePipelineTracker:
                         if center_3d is not None:
                             # 3D 防呆 1: 防前景誤判 (若 Z 值比果串還要近，則駁回)
                             # if self.last_bunch_3d_pos is not None and center_3d[2] < (self.last_bunch_3d_pos[2] - 0.05):
-                            #     rospy.logwarn_throttle(0.5, "[stem] REJECTED: Foreground leaf (Z too close).")
+                            #     rospy.logwarn_throttle(0.5, "[frond] REJECTED: Foreground leaf (Z too close).")
                             #     center_3d = None 
 
                             # 3D 防呆 2: 防止空間跳躍 (過濾旁邊干擾的樹枝)
                             if center_3d is not None and predicted_3d is not None:
                                 jump_dist = float(np.linalg.norm(center_3d - predicted_3d))
                                 if jump_dist > self.stem_max_jump_m:  
-                                    rospy.logwarn_throttle(0.5, f"[stem] REJECTED: Jumped {jump_dist:.2f}m")
+                                    rospy.logwarn_throttle(0.5, f"[frond] REJECTED: Jumped {jump_dist:.2f}m")
                                     center_3d = None 
 
                             if center_3d is not None:
@@ -2167,12 +2156,12 @@ class FoundationPosePipelineTracker:
                                     # 修正：計算相機到目標的三維直線距離 (歐式距離 = 根號(X^2 + Y^2 + Z^2))
                                     true_dist = float(np.linalg.norm(smoothed_3d))
                                     
-                                    cv2.putText(vis_bgr, f"Dist: {true_dist:.2f}m", (projected_2d[0] + 10, projected_2d[1] - 10), 
+                                    cv2.putText(vis_bgr, f"Distance: {true_dist:.2f}m", (projected_2d[0] + 10, projected_2d[1] - 10), 
                                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                                 
                                 parent_frame = self.camera_tf if self.camera_tf else "camera_color_optical_frame"
-                                self.broadcast_transform_and_pose(self.pose_stem, "stem", parent_frame)
-                                self.confidence_publish("stem", 1.0, True, used_seg=True)
+                                self.broadcast_transform_and_pose(self.pose_stem, "frond", parent_frame)
+                                self.confidence_publish("frond", 1.0, True, used_seg=True)
                                 
                         if center_3d is None:
                             self._reset_stem_to_cruising(
@@ -2187,7 +2176,7 @@ class FoundationPosePipelineTracker:
             # 6. GUI 資訊更新
             # ==========================================
             if self.show_rgb_win:
-                if self.mode == "bunch" and self.pose_bunch is not None:
+                if self.mode == "fruit" and self.pose_bunch is not None:
                     cv2.putText(
                         vis_bgr,
                         f"BUNCH: FOUNDATIONPOSE TRACKING (Init Mode {self.bunch_pipeline_mode})",
@@ -2197,10 +2186,10 @@ class FoundationPosePipelineTracker:
                         (0, 0, 255),
                         2,
                     )
-                elif self.mode == "stem":
+                elif self.mode == "frond":
                     cv2.putText(vis_bgr, f"BUNCH: PAUSED (STEM MODE)", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2)
 
-                if self.mode == "stem" and self.stem_cutie_state == "SERVOING":
+                if self.mode == "frond" and self.stem_cutie_state == "SERVOING":
                     tracker_name = "SAM2" if self.stem_pipeline_mode == 4 else "CUTIE"
                     cv2.putText(vis_bgr, f"STEM: {tracker_name} LOCKED (Mode {self.stem_pipeline_mode})", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 

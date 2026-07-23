@@ -5,8 +5,8 @@
   <!-- 彩色影像、對齊後的深度圖、相機內參的Topic -->
   <arg name="camera_tf" default="camera_color_optical_frame"/>
   <!-- 相機的TF座標系 -->
-  <arg name="bunch_name" default="oilpalm"/>
-  <arg name="stem_name" default="stem"/>
+  <arg name="fruit_name" default="oilpalm"/>
+  <arg name="frond_name" default="frond"/>
   
   <arg name="mesh_file" default="$(find ros_foundationpose)/data/oilpalm/oilpalm.obj"/> 
   <!-- 果串的 3D 模型檔 (.obj) -->
@@ -15,7 +15,7 @@
 
   <arg name="det_model" default="$(find ros_foundationpose)/data/oilpalm_stem_new.onnx"/>
   <!-- YOLO detection模型的權重檔 -->
-  <arg name="seg_model" default="$(find ros_foundationpose)/data/bunch_stem-seg.pt"/>
+  <arg name="seg_model" default="$(find ros_foundationpose)/data/oilpalm_stem-seg.pt"/>
   <!-- YOLOv11-seg模型的權重路徑 -->
   <arg name="sam_ckpt" default="$(find ros_foundationpose)/data/sam/sam_b.pt"/>
   <!-- SAM模型的權重路徑 -->
@@ -26,9 +26,9 @@
 
   <arg name="yolo_start_mode" default="wait"/>
   <!-- immediate or wait -->
-  <arg name="bunch_pipeline_mode" default="2"/> 
+  <arg name="fruit_pipeline_mode" default="2"/> 
   <!-- 1: YOLO + SAM; 2: YOLO + SAM2; 3: YOLO + FastSAM; 4: YOLO11-seg -->
-  <arg name="stem_pipeline_mode" default="2"/> 
+  <arg name="frond_pipeline_mode" default="2"/> 
   <!-- 1: YOLO + SAM + Cutie; 2: YOLO + SAM2 + Cutie; 3: YOLO + FastSAM + Cutie; 4: YOLO + SAM2 -->
 
   <arg name="det_conf" default="0.25"/>
@@ -36,6 +36,8 @@
   <arg name="det_imgsz" default="640"/>
   <arg name="det_select_mode" default="nearest_depth"/>
   <!-- YOLO的挑選策略 score / middle / nearest_depth -->
+  <arg name="cls_fruit" default="0"/>
+  <arg name="cls_frond" default="1"/>
 
   <arg name="init_det_patience" default="15"/>
   <!-- YOLO 需連續穩定偵測 N 幀，才進行分割與 FoundationPose 初始化。 -->
@@ -55,21 +57,18 @@
 
   <arg name="roi_expand" default="0.01"/>
   <!-- FoundationPose 深度幾何自我評估：MAE 越低越好，Inlier Ratio 越高越好。 -->
-  <arg name="geom_mae_thresh" default="0.10"/>
+  <arg name="geom_mae_thresh" default="0.2"/>
   <!-- MAE > 此值，視為重新初始化候選，單位 m。 -->
-  <arg name="geom_inlier_thresh" default="0.50"/>
+  <arg name="geom_inlier_thresh" default="0.35"/>
   <!-- Inlier Ratio < 此值，視為重新初始化候選。 -->
   <arg name="occ_mae_thresh" default="0.05"/>
   <!-- MAE <= 此值且 Inlier Ratio >= occ_inlier_thresh，視為低遮蔽。 -->
-  <arg name="occ_inlier_thresh" default="0.8"/>
+  <arg name="occ_inlier_thresh" default="0.9"/>
   <!-- 介於重新初始化門檻與低遮蔽門檻之間，視為高遮蔽。 -->
   <arg name="geom_patience" default="5"/>
   <!-- 連續 N 幀為重新初始化候選時，以目前 Cutie mask 重新註冊 FoundationPose，並同時判為高遮蔽。 -->
   <arg name="policy_high_patience" default="3"/>
-  <!-- 連續高遮蔽 N 幀後切換至 STEM 模式。 -->
-
-  <arg name="cls_bunch" default="0"/>
-  <arg name="cls_stem" default="1"/>
+  <!-- 連續高遮蔽 N 幀後切換至 frond 模式。 -->
 
   <arg name="show_depth_window" default="false"/>
   <arg name="show_rgb_window" default="true"/>
@@ -83,11 +82,11 @@
 
   <arg name="cmd_vel_topic" default="/cmd_vel"/>
   <!-- 預測葉莖在畫面中的新位置 -->
-  <arg name="stem_lost" default="3.0"/>
-  <arg name="stem_depth_min" default="0.1"/>
-  <arg name="stem_depth_max" default="3.0"/>
+  <arg name="frond_lost" default="3.0"/>
+  <arg name="frond_depth_min" default="0.1"/>
+  <arg name="frond_depth_max" default="3.0"/>
   <!-- 葉莖有效深度的上下限 -->
-  <arg name="stem_assumed_radius" default="0.0"/>
+  <arg name="frond_assumed_radius" default="0.0"/>
   <!-- 深度圖只能拍到表面，假設葉莖半徑為N公尺，以求得真正的中心點 -->
   <arg name="max_jump_m" default="0.06"/>
   <!-- 限制兩幀之間葉莖 3D 座標的最大移動距離 -->
@@ -99,8 +98,8 @@
     <param name="info_topic" value="$(arg info_topic)"/>
     <param name="depth_topic" value="$(arg depth_topic)"/>
     <param name="camera_tf" value="$(arg camera_tf)"/>
-    <param name="bunch_name" value="$(arg bunch_name)"/>
-    <param name="stem_name" value="$(arg stem_name)"/>
+    <param name="fruit_name" value="$(arg fruit_name)"/>
+    <param name="frond_name" value="$(arg frond_name)"/>
 
     <param name="det_model" value="$(arg det_model)"/>
     <param name="mesh_file" value="$(arg mesh_file)"/>
@@ -140,19 +139,19 @@
     <param name="colormap" value="$(arg colormap)"/>
     <param name="invert_colormap" value="$(arg invert_colormap)"/>
 
-    <param name="postproc/bunch/pipeline_mode" value ="$(arg bunch_pipeline_mode)"/>
+    <param name="postproc/fruit/pipeline_mode" value ="$(arg fruit_pipeline_mode)"/>
 
-    <param name="postproc/stem/pipeline_mode" value ="$(arg stem_pipeline_mode)"/>
-    <param name="postproc/stem/cmd_vel_topic" value="$(arg cmd_vel_topic)" />
-    <param name="postproc/stem/stem_lost" value="$(arg stem_lost)" />
-    <param name="postproc/stem/stem_depth_min" value="$(arg stem_depth_min)" />
-    <param name="postproc/stem/stem_depth_max" value="$(arg stem_depth_max)" />
-    <param name="postproc/stem/stem_assumed_radius" value="$(arg stem_assumed_radius)" />
-    <param name="postproc/stem/max_jump_m" value="$(arg max_jump_m)" />
-    <param name="postproc/stem/ema_alpha" value="$(arg ema_alpha)" />
+    <param name="postproc/frond/pipeline_mode" value ="$(arg frond_pipeline_mode)"/>
+    <param name="postproc/frond/cmd_vel_topic" value="$(arg cmd_vel_topic)" />
+    <param name="postproc/frond/frond_lost" value="$(arg frond_lost)" />
+    <param name="postproc/frond/frond_depth_min" value="$(arg frond_depth_min)" />
+    <param name="postproc/frond/frond_depth_max" value="$(arg frond_depth_max)" />
+    <param name="postproc/frond/frond_assumed_radius" value="$(arg frond_assumed_radius)" />
+    <param name="postproc/frond/max_jump_m" value="$(arg max_jump_m)" />
+    <param name="postproc/frond/ema_alpha" value="$(arg ema_alpha)" />
 
-    <param name="classes/bunch" value ="$(arg cls_bunch)"/>
-    <param name="classes/stem" value ="$(arg cls_stem)"/>
+    <param name="classes/fruit" value ="$(arg cls_fruit)"/>
+    <param name="classes/frond" value ="$(arg cls_frond)"/>
     <param name="policy/high_patience" value ="$(arg policy_high_patience)"/>
 
     <param name="postproc/seg_model" value ="$(arg seg_model)"/>

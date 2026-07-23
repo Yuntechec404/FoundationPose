@@ -342,8 +342,8 @@ class FoundationPoseTracker:
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"detector model not found: {model_path}")
         def _onnx_sibling(p):
-            stem, ext = os.path.splitext(p)
-            return stem + ".onnx"
+            frond, ext = os.path.splitext(p)
+            return frond + ".onnx"
 
         ext = os.path.splitext(model_path)[1].lower()
         det_device = "cpu"
